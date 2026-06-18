@@ -1,0 +1,8 @@
+# Never commit a real config — it may contain your Groq API key.
+# (The recommended location, ~/.config/dictation/config.toml, is outside this
+# repo and already safe; this covers the in-project fallback config.toml.)
+config.toml
+
+# Python
+__pycache__/
+*.pyc

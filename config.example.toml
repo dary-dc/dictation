@@ -1,0 +1,41 @@
+# Dictation config.
+#
+# Copy this file to ~/.config/dictation/config.toml and fill in your key:
+#
+#     mkdir -p ~/.config/dictation
+#     cp config.example.toml ~/.config/dictation/config.toml
+#     ${EDITOR:-nano} ~/.config/dictation/config.toml
+#
+# A config file (not a shell env var) is the reliable choice: GNOME custom
+# shortcuts run with a minimal environment and will NOT see GROQ_API_KEY
+# exported in your ~/.bashrc.
+
+# Get a free key at https://console.groq.com/keys
+api_key = "gsk_PASTE_YOUR_KEY_HERE"
+
+# Groq Whisper model:
+#   whisper-large-v3-turbo  — fast, excellent quality (recommended)
+#   whisper-large-v3        — highest quality, slightly slower
+model = "whisper-large-v3-turbo"
+
+# Language hint: a 2-letter ISO code ("en", "es", "fr", ...) or "auto" to detect.
+language = "en"
+
+# Optional. Biases Whisper toward your vocabulary and spelling — useful for
+# technical dictation (product names, code identifiers, jargon). Leave empty to disable.
+prompt = "Technical software engineering dictation, including code and architecture terms."
+
+# Append every transcription to ~/.local/state/dictation/history.log (handy for
+# reviewing your spoken English later). Off by default.
+save_history = false
+
+# Desktop notifications — how chatty to be:
+#   all     — recording, transcribing, done, and problems (default)
+#   minimal — only the "🎙️ recording" and "📋 ready to paste" cues, no chatter
+#   errors  — stay silent unless something goes wrong
+#   none    — never notify
+# (Override per-run with --notify LEVEL, or -q/--quiet for none.)
+notifications = "all"
+
+# Verbose logging to stderr and ~/.local/state/dictation/debug.log (or pass --debug).
+debug = false
