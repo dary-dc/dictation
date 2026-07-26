@@ -5,13 +5,15 @@ It edits the dconf custom-keybindings list *non-destructively*: existing
 shortcuts are kept, and re-running updates the dictation entries in place
 instead of creating duplicates.
 
-    python3 install-shortcuts.py                 # one toggle key (default)
+    python3 install-shortcuts.py                 # simple + full toggle keys (default)
     python3 install-shortcuts.py --mode pair     # separate start + stop keys
-    python3 install-shortcuts.py --toggle-key '<Super>z'
+    python3 install-shortcuts.py --simple-key '<Super>z'
     python3 install-shortcuts.py --remove        # remove dictation shortcuts
 
 Default bindings (change anytime in Settings → Keyboard → Custom Shortcuts):
-    toggle : <Super>d        (left-hand, two-finger: Super + D)
+    simple : <Super>d         plain single-pass groq — fast, no overlay (as it always was)
+    full   : <Super>w         live overlay + 3-engine ensemble + judge
+    resend : <Super><Shift>d  re-transcribe or re-copy the last recording
     pair   : start <Control><Alt>d   stop <Control><Alt>s
 
 Note: <Control>m is intentionally avoided — in terminals it is the Enter key.
@@ -88,32 +90,49 @@ def remove(commands: list[str]) -> None:
     print(f"Removed {removed} dictation shortcut(s).")
 
 
+def dictation_command(script: Path, *args: str) -> str:
+    """Prefer the project-local .venv; fall back to `uv run` if not bootstrapped."""
+    venv_python = script.parent / ".venv" / "bin" / "python"
+    tail = " ".join(args)
+    if venv_python.is_file():
+        return f"{venv_python} {script} {tail}".strip()
+    uv = shutil.which("uv") or str(Path.home() / ".local/bin/uv")
+    return f"{uv} run {script} {tail}".strip()
+
+
 def main() -> int:
     if not shutil.which("gsettings"):
         sys.exit("gsettings not found — this installer is for GNOME only.")
 
-    uv = shutil.which("uv") or str(Path.home() / ".local/bin/uv")
-    script = str(Path(__file__).resolve().parent / "dictation.py")
+    script = Path(__file__).resolve().parent / "dictation.py"
 
-    cmd_toggle = f"{uv} run {script} toggle"
-    cmd_start = f"{uv} run {script} start"
-    cmd_stop = f"{uv} run {script} stop"
+    cmd_toggle = dictation_command(script, "toggle")
+    cmd_simple = dictation_command(script, "toggle", "--simple")
+    cmd_start = dictation_command(script, "start")
+    cmd_stop = dictation_command(script, "stop")
+    cmd_resend = dictation_command(script, "resend")
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mode", choices=["toggle", "pair"], default="toggle")
-    ap.add_argument("--toggle-key", default="<Super>d")
+    ap.add_argument("--simple-key", default="<Super>d")
+    ap.add_argument("--full-key", default="<Super>w")
+    ap.add_argument("--resend-key", default="<Super><Shift>d")
     ap.add_argument("--start-key", default="<Control><Alt>d")
     ap.add_argument("--stop-key", default="<Control><Alt>s")
     ap.add_argument("--remove", action="store_true", help="remove dictation shortcuts and exit")
     args = ap.parse_args()
 
     if args.remove:
-        remove([cmd_toggle, cmd_start, cmd_stop])
+        remove([cmd_toggle, cmd_simple, cmd_start, cmd_stop, cmd_resend])
         return 0
 
     if args.mode == "toggle":
-        print("Installing single toggle shortcut:")
-        upsert("Dictation: toggle", cmd_toggle, args.toggle_key)
+        print("Installing toggle shortcuts:")
+        # Order matters: the pre-existing full-toggle entry may hold the
+        # simple key's binding — rebind it first so the keys never collide.
+        upsert("Dictation: full (overlay + ensemble)", cmd_toggle, args.full_key)
+        upsert("Dictation: simple (fast single-pass)", cmd_simple, args.simple_key)
+        upsert("Dictation: resend last recording", cmd_resend, args.resend_key)
     else:
         print("Installing start + stop shortcuts:")
         upsert("Dictation: start", cmd_start, args.start_key)

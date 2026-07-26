@@ -9,10 +9,34 @@ stop it.
 
 ## What it does
 
-- **`toggle`** — one key (**Super + D** by default): press to start recording, press
-  again to stop, transcribe, and copy.
+- **Two shortcuts, two moods** (installed by `install-shortcuts.py`):
+  **Super + D** — simple mode: plain single-pass Groq, no overlay, fastest
+  (`toggle --simple`). **Super + W** — full mode: live overlay + 3-engine
+  ensemble + judge (`toggle`). Either key stops a running recording; the
+  session always finishes in the mode it was started with.
+  **Super + Shift + D** — resend the last recording (re-transcribe or re-copy
+  without touching the mic).
 - Records continuously to a temp WAV (16 kHz mono), then ships it to Groq's
   `whisper-large-v3-turbo` and puts the result on your clipboard.
+- **Live overlay** (on by default): while you speak, a small frameless
+  always-on-top window shows the transcription in real time (grey = still
+  changing, white = final). Drag it anywhere — it reappears there next time.
+  Display only; the clipboard still gets the settled ensemble text on stop.
+- **Ensemble mode** (on by default when Deepgram + Gemini keys are available —
+  both auto-reused from Bridge/web-agent): the WAV is transcribed by three
+  engines in parallel (Groq whisper-large-v3, Groq turbo, Deepgram nova-3),
+  hallucinated tails are stripped, and majority wording wins — a Gemini judge
+  reconstructs only genuine three-way disagreements. Slow engines are
+  abandoned after ~6 s. Set `ensemble = false` for the old instant single pass.
+- **Last recording recovery** (`save_last_recording = true`): each dictation
+  saves `last.wav` under `~/.local/state/dictation/` before transcribing. If
+  transcription or clipboard fails, press **Super + Shift + D** (or
+  `dictation.py resend`) to retry — no re-speaking. Transient API errors
+  auto-retry twice; clipboard-only retry is instant when a transcript was
+  already saved.
+- **Quality lab** (`lab = true`): the last 20 dictations keep their audio and
+  an engine-by-engine record — run `uv run dictation.py lab` to compare what
+  each engine heard vs. what reached your clipboard.
 - Desktop notifications (tunable — see [Notifications](#notifications)) tell you
   when it's recording, transcribing, and done.
 
@@ -29,25 +53,26 @@ stop it.
 
 ## Isolation & footprint
 
-This app does **not** pollute your system. No `sudo`, no global installs, your
-system Python is never modified.
+This app does **not** pollute your system. No `sudo`, no global `pip install`,
+your system Python is never modified.
 
-- `uv` reads the dependency block inside `dictation.py` and builds a **cached,
-  isolated virtual environment** on first run, reusing it afterward.
-- On a machine with only Python 3.14, `uv` downloads a private CPython 3.13 — kept
-  in `uv`'s own directory, shared with any other `uv` script you run.
+- Dependencies live in a **project-local** `.venv/` (created by `./setup.sh` or
+  `uv sync`). Nothing is installed user-wide or system-wide.
+- [`uv`](https://docs.astral.sh/uv/) manages the venv and downloads a private
+  CPython 3.13 if needed — kept in `~/.local/share/uv/`, shared with other
+  `uv` projects but **not** mixed into your system Python.
 
 Everything that ends up on disk:
 
 | Location | What | Notes |
 |---|---|---|
-| the cloned repo | The script files | The app itself |
+| the cloned repo | The script files + `.venv/` | Delete the folder to remove the app |
 | `~/.config/dictation/config.toml` | Your key & settings | Only if you create it (see Setup) |
-| `~/.cache/uv/` | Cached dependencies | **Shared** `uv` cache, not app-specific |
+| `~/.cache/uv/` | Cached dependency wheels | **Shared** `uv` cache, speeds up installs |
 | `~/.local/share/uv/python/` | Managed CPython 3.13 | **Shared**, reusable by any `uv` project |
 | `$XDG_RUNTIME_DIR/dictation/` | Temp audio while recording | RAM-backed, auto-wiped at logout |
-| `~/.local/state/dictation/` | Debug log & optional history | `debug.log`; `history.log` if `save_history = true` |
-| GNOME dconf | One custom-shortcut entry | Only if you run the installer |
+| `~/.local/state/dictation/` | Debug log, recovery slot & optional history | `last.wav` + `last.txt`; `debug.log`; `history.log` if `save_history = true` |
+| GNOME dconf | Custom shortcut entries | Only if you run the installer |
 
 See [Uninstall](#uninstall) to remove all of it.
 
@@ -61,7 +86,7 @@ sudo dnf install wl-clipboard libnotify portaudio
 ```
 
 - [`uv`](https://docs.astral.sh/uv/) — install with `curl -LsSf https://astral.sh/uv/install.sh | sh`.
-  It reads the inline dependency block in `dictation.py`, so there's nothing to `pip install`.
+  It creates the project `.venv/`; there is nothing to `pip install` globally.
 
 ## Setup
 
@@ -88,32 +113,35 @@ nano ~/.config/dictation/config.toml      # paste your gsk_... key
 > environment and will **not** see `GROQ_API_KEY` exported in your `~/.bashrc`.
 > The config file is read directly by the script, so it always works.
 
-### 4. Verify
+### 4. Install (venv + shortcuts)
 
 ```bash
-uv run dictation.py doctor
+chmod +x setup.sh
+./setup.sh
 ```
 
-You want `READY ✅`. The first run downloads dependencies (a few seconds); after
-that it's cached and fast. (`doctor` treats the unedited `gsk_PASTE...` placeholder
-as "no key", so it won't give you a false pass.)
+This creates `.venv/` in the project, installs dependencies, runs `doctor`, and
+registers **Super+D**, **Super+W**, and **Super+Shift+D** (resend). Re-run after
+pulling updates. Shortcut-only refresh: `./setup.sh --shortcuts`.
 
-### 5. Bind a shortcut
+You want `READY ✅` from the doctor step. (`doctor` treats the unedited
+`gsk_PASTE...` placeholder as "no key", so it won't give you a false pass.)
 
-**Option A — one toggle key (recommended):**
+### 5. Bind a shortcut (manual alternative)
+
+**Option A — recommended (done by `setup.sh`):**
 
 ```bash
 python3 install-shortcuts.py
 ```
 
-This registers **`Super + D`** to toggle dictation — a comfortable left-hand,
-two-finger combo (thumb on Super + middle finger on D). As a *global* GNOME
-shortcut it takes priority, so it won't clash with Cursor/VS Code. The installer
-edits GNOME's custom shortcuts non-destructively and won't duplicate on re-run.
-Pick a different key:
+This registers **`Super + D`** (simple), **`Super + W`** (full), and
+**`Super + Shift + D`** (resend). As *global* GNOME shortcuts they take
+priority over app-local bindings. The installer edits shortcuts
+non-destructively and won't duplicate on re-run. Pick different keys:
 
 ```bash
-python3 install-shortcuts.py --toggle-key '<Super>r'
+python3 install-shortcuts.py --simple-key '<Super>z'
 ```
 
 **Option B — two keys (start / stop), like the original idea:**
@@ -127,9 +155,9 @@ python3 install-shortcuts.py --mode pair
 View and Customize → Custom Shortcuts → +*
 
 - **Name:** `Dictation: toggle`
-- **Command:** `/ABS/PATH/TO/uv run /ABS/PATH/TO/dictation/dictation.py toggle`
+- **Command:** `/ABS/PATH/TO/dictation/.venv/bin/python /ABS/PATH/TO/dictation/dictation.py toggle`
   — use absolute paths (GNOME shortcuts run with a minimal `PATH`); get them with
-  `which uv` and `realpath dictation.py`.
+  `realpath dictation.py` and `realpath .venv/bin/python`.
 - **Shortcut:** whatever you like — avoid `Ctrl+M` (that's Enter in terminals).
 
 ## Your workflow
@@ -140,6 +168,9 @@ View and Customize → Custom Shortcuts → +*
    in clean spoken English.
 3. Press **`Super + D`** again. It transcribes and copies the text.
 4. Hit **`Ctrl + V`** where you want the text. Done.
+
+If transcription or clipboard fails after a long dictation, press **`Super + Shift + D`**
+to resend the last recording — no need to speak it again.
 
 ## Notifications
 
@@ -219,6 +250,7 @@ See `config.example.toml`. Notable options:
 - `notifications` — `all` / `minimal` / `errors` / `none` (see [Notifications](#notifications)).
 - `debug` — verbose logging to `~/.local/state/dictation/debug.log`.
 - `save_history` — append transcripts to `~/.local/state/dictation/history.log`.
+- `save_last_recording` — keep one recovery WAV at `~/.local/state/dictation/last.wav` (default on).
 
 ## Troubleshooting
 
@@ -235,6 +267,9 @@ See `config.example.toml`. Notable options:
   run `doctor` once to warm the cache.
 - **Shortcut does nothing** — the key combo may already be taken; change it in
   *Settings → Keyboard → Custom Shortcuts*.
+- **Resend keeps copying a bad transcript** — delete `~/.local/state/dictation/last.txt`
+  and press **Super + Shift + D** again to force a full re-transcription from
+  `last.wav`.
 
 ## Uninstall
 
@@ -243,7 +278,7 @@ Remove everything this app added:
 ```bash
 python3 install-shortcuts.py --remove                  # from the repo dir — removes the GNOME shortcut
 rm -rf ~/.config/dictation ~/.local/state/dictation    # config, logs & history
-rm -rf <the cloned dictation folder>                   # the app itself
+rm -rf <the cloned dictation folder>                   # the app + its .venv
 ```
 
 That returns your machine to its prior state. The only remainder is `uv`'s shared
@@ -259,7 +294,9 @@ rm -rf ~/.local/share/uv
 
 | File | Purpose |
 |---|---|
-| `dictation.py` | The app — `toggle` / `start` / `stop` / `doctor` |
+| `dictation.py` | The app — `toggle` / `start` / `stop` / `resend` / `doctor` |
+| `pyproject.toml` | Dependencies (managed by `uv sync` into `.venv/`) |
+| `setup.sh` | Bootstrap `.venv`, run doctor, install shortcuts |
 | `config.example.toml` | Copy to `~/.config/dictation/config.toml` |
 | `install-shortcuts.py` | Register/remove GNOME keyboard shortcuts |
 | `.gitignore` | Keeps a real `config.toml` out of version control |
@@ -268,12 +305,9 @@ rm -rf ~/.local/share/uv
 ## Manual use (no shortcut)
 
 ```bash
-uv run dictation.py toggle              # press once, run again to stop
-uv run dictation.py start               # or drive the two halves yourself
-uv run dictation.py stop
-uv run dictation.py doctor              # check your setup
-uv run dictation.py toggle --quiet      # one-off silent run
-uv run dictation.py toggle --debug      # one-off verbose run
+.venv/bin/python dictation.py toggle      # or: uv run dictation.py toggle
+.venv/bin/python dictation.py resend      # retry last recording after a failure
+.venv/bin/python dictation.py doctor      # check your setup
 ```
 
 ## License

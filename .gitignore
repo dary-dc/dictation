@@ -6,3 +6,4 @@ config.toml
 # Python
 __pycache__/
 *.pyc
+.venv/

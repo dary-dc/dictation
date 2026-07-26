@@ -10,6 +10,14 @@
 # shortcuts run with a minimal environment and will NOT see GROQ_API_KEY
 # exported in your ~/.bashrc.
 
+# Speech-to-text backend:
+#   groq      — record to WAV, transcribe when you stop (default, free Groq tier)
+#   deepgram  — stream mic to Deepgram Nova in real time (same backend as Bridge)
+stt_backend = "groq"
+
+# ---------------------------------------------------------------------------
+# Groq (stt_backend = "groq")
+# ---------------------------------------------------------------------------
 # Get a free key at https://console.groq.com/keys
 api_key = "gsk_PASTE_YOUR_KEY_HERE"
 
@@ -18,16 +26,69 @@ api_key = "gsk_PASTE_YOUR_KEY_HERE"
 #   whisper-large-v3        — highest quality, slightly slower
 model = "whisper-large-v3-turbo"
 
+# ---------------------------------------------------------------------------
+# Deepgram (stt_backend = "deepgram")
+# ---------------------------------------------------------------------------
+# Get a key at https://console.deepgram.com (includes ~$200 free credit).
+# If omitted, dictation reuses deepgram_api_key from ~/.config/bridge/config.toml.
+# deepgram_api_key = "YOUR_DEEPGRAM_KEY"
+# Or: export DEEPGRAM_API_KEY=...
+
+# Deepgram model when stt_backend = "deepgram":
+# model = "nova-3"
+
+# Domain terms to boost (Nova-3 keyterm prompting). Up to ~40 used.
+# keyterms = ["Cursor", "PipeWire", "ffmpeg"]
+
+# ---------------------------------------------------------------------------
+# Live overlay (groq backend only)
+# ---------------------------------------------------------------------------
+# While recording, show a small frameless always-on-top window with the live
+# transcription (Deepgram streaming; display only — the clipboard still gets
+# the settled ensemble text). Drag it anywhere; its position is remembered in
+# ~/.local/state/dictation/overlay.json. Runs via XWayland so the position can
+# be restored (Wayland forbids self-positioning). No Deepgram key → the window
+# just shows "● recording…".
+overlay = true
+# overlay_font_size = 11
+
+# ---------------------------------------------------------------------------
+# Ensemble (groq backend only) — the Bridge accuracy architecture
+# ---------------------------------------------------------------------------
+# When you stop recording, the WAV is transcribed by THREE engines in parallel
+# (Groq whisper-large-v3, Groq turbo, Deepgram nova-3). Known hallucinated
+# tails ("thank you for watching") are stripped. If two engines agree, that
+# text wins directly; otherwise a fast Gemini "judge" reconstructs the
+# majority wording. A slow engine is abandoned after ~6 s. Needs Deepgram +
+# Gemini keys (auto-reused from Bridge / web-agent); single-pass without them.
+ensemble = true
+# ensemble_model = "whisper-large-v3"          # Groq engine used in ensemble mode
+# judge_model = "gemini-flash-lite-latest"
+# gemini_api_key = "AIza..."
+
+# Quality lab: keep the last 20 dictations' WAV + an engine-by-engine record
+# so accuracy problems in real usage can be diagnosed and compared (each
+# engine's text/latency, the judge's verdict, and what reached the clipboard).
+# Review with:  dictation.py lab
+lab = true
+
+# ---------------------------------------------------------------------------
+# Shared
+# ---------------------------------------------------------------------------
 # Language hint: a 2-letter ISO code ("en", "es", "fr", ...) or "auto" to detect.
 language = "en"
 
-# Optional. Biases Whisper toward your vocabulary and spelling — useful for
-# technical dictation (product names, code identifiers, jargon). Leave empty to disable.
+# Groq only. Biases Whisper toward your vocabulary and spelling.
 prompt = "Technical software engineering dictation, including code and architecture terms."
 
 # Append every transcription to ~/.local/state/dictation/history.log (handy for
 # reviewing your spoken English later). Off by default.
 save_history = false
+
+# Keep the last recording at ~/.local/state/dictation/last.wav (overwritten each
+# time) so you can retry after a transcription or clipboard failure without
+# re-speaking. Press Super+Shift+D or run: dictation.py resend
+save_last_recording = true
 
 # Desktop notifications — how chatty to be:
 #   all     — recording, transcribing, done, and problems (default)
