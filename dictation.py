@@ -70,12 +70,17 @@ ENSEMBLE_MAX_WAIT_SEC = 90.0  # ceiling on the same, for very long recordings
 
 # Whisper pads trailing silence with YouTube-ish boilerplate; strip it from a
 # transcription's tail. Kept conservative — only phrases nobody dictates.
+# Longer variants are listed in full because the guard below allows a marker
+# only 8 characters of slack: "subtitles by" alone never matched the phrase it
+# was added for, "Subtitles by Amara.org" being 22 characters long.
 HALLUCINATED_TAILS = (
     "thank you for watching",
     "thanks for watching",
     "see you in the next video",
     "subtitles by",
     "amara org",
+    "subtitles by amara org",
+    "subtitles by the amara org community",
 )
 
 # Which notification categories each level is allowed to show.
@@ -390,14 +395,77 @@ def _process_alive(pid: int) -> bool:
         return False
 
 
-def active_recorder_pid() -> int | None:
-    """Return the PID of a live recorder, or None (cleaning up stale PID files)."""
+def _process_start_ticks(pid: int) -> str | None:
+    """Field 22 of /proc/<pid>/stat: when the process started, in clock ticks.
+
+    A pid alone is not an identity. pids are recycled — a busy machine walks the
+    whole default pid_max in a day — so a recorder that died without cleaning up
+    (OOM, SIGKILL, a crash) leaves a PID file naming a number some unrelated
+    process later owns. Pairing the pid with its start time tells our recorder
+    from a stranger wearing its number.
+    """
     try:
-        pid = int(PID_PATH.read_text().strip())
-    except (FileNotFoundError, ValueError):
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            return fh.read().rpartition(")")[2].split()[19]
+    except (OSError, IndexError):
         return None
+
+
+def _cmdline_is_dictation(pid: int) -> bool:
+    """Last-resort identity check: does this process's command line name us?
+
+    Only reached for a PID file with no recorded start time — one written by a
+    version before that existed. A pid alone is worth nothing, so check what the
+    process actually is rather than trusting the number.
+    """
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            return b"dictation" in fh.read().lower()
+    except OSError:
+        return False
+
+
+def _is_our_recorder(pid: int, started: str) -> bool:
+    """True if `pid` is a live process that is the recorder the PID file meant."""
     if not _process_alive(pid):
-        PID_PATH.unlink(missing_ok=True)  # stale
+        return False
+    if started != "-":
+        return _process_start_ticks(pid) == started
+    return _cmdline_is_dictation(pid)
+
+
+def _slot_record(pid: int) -> str:
+    """What the PID file holds: the pid, and the identity that survives a recycle."""
+    return f"{pid} {_process_start_ticks(pid) or '-'}"
+
+
+def _slot_owner() -> int | None:
+    """The pid the PID file names, alive or not. None if absent or unreadable."""
+    try:
+        return int(PID_PATH.read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def active_recorder_pid() -> int | None:
+    """Return the PID of a live recorder, or None (cleaning up stale PID files).
+
+    A file we cannot parse is stale by definition: claim_recorder_slot()
+    publishes name and contents in one step, so a half-written claim is never
+    visible here — anything unreadable is leftover junk, and leaving it in place
+    would jam every later claim against it.
+    """
+    try:
+        fields = PID_PATH.read_text().split()
+        pid = int(fields[0])
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, IndexError):
+        log("clearing an unreadable recorder pid file")
+        PID_PATH.unlink(missing_ok=True)
+        return None
+    if not _is_our_recorder(pid, fields[1] if len(fields) > 1 else "-"):
+        PID_PATH.unlink(missing_ok=True)  # dead recorder, or its pid reused by a stranger
         return None
     return pid
 
@@ -405,37 +473,44 @@ def active_recorder_pid() -> int | None:
 def claim_recorder_slot() -> bool:
     """Atomically claim the recorder slot. False if a live recorder already holds it.
 
-    O_EXCL makes the claim one indivisible step. Checking active_recorder_pid()
-    and then writing the file is not: the gap spans the sounddevice/Qt imports
-    (~1 s), so two presses of the toggle key both passed the check and both
-    recorded. The loser overwrote the PID file, orphaning the winner — a
-    recorder still holding the microphone that no stop/toggle could ever reach.
+    os.link() makes the claim one indivisible step, and publishes a file whose
+    contents were complete before its name existed. Both halves matter:
+
+    - Checking active_recorder_pid() and then writing is not atomic: the gap
+      spans the sounddevice/Qt imports (~1 s), so two presses of the toggle key
+      both passed the check and both recorded. The loser overwrote the PID file,
+      orphaning the winner — a recorder still holding the microphone that no
+      stop/toggle could ever reach.
+    - O_CREAT|O_EXCL claims the name but leaves the file empty until the write a
+      moment later. A recorder that died in that window (SIGKILL, a full disk)
+      left a file nothing could read and nothing would clear, so every later
+      claim lost to it: "Already recording", forever, with nothing recording.
     """
-    for _ in range(2):
-        try:
-            fd = os.open(PID_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        except FileExistsError:
-            # Either a live recorder owns it, or it is stale — active_recorder_pid()
-            # tells the two apart and clears a stale file, so the retry can win it.
-            if active_recorder_pid() is not None:
-                return False
-            continue
-        except OSError as exc:
-            log(f"recorder slot claim failed: {exc}")
-            return False
-        with os.fdopen(fd, "w") as fh:
-            fh.write(str(os.getpid()))
-        return True
-    return False
+    tmp = PID_PATH.with_name(f"{PID_PATH.name}.{os.getpid()}")
+    try:
+        tmp.write_text(_slot_record(os.getpid()))
+        for _ in range(2):
+            try:
+                os.link(tmp, PID_PATH)
+            except FileExistsError:
+                # Either a live recorder owns it, or it is stale — active_recorder_pid()
+                # tells the two apart and clears a stale file, so the retry can win it.
+                if active_recorder_pid() is not None:
+                    return False
+                continue
+            return True
+        return False
+    except OSError as exc:
+        log(f"recorder slot claim failed: {exc}")
+        return False
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def release_recorder_slot() -> None:
     """Drop the PID file only if it is still ours — never steal another recorder's."""
-    try:
-        if int(PID_PATH.read_text().strip()) == os.getpid():
-            PID_PATH.unlink(missing_ok=True)
-    except (FileNotFoundError, ValueError, OSError):
-        pass
+    if _slot_owner() == os.getpid():
+        PID_PATH.unlink(missing_ok=True)
 
 
 def _release_audio() -> None:
@@ -478,7 +553,15 @@ def record(cfg: dict, simple: bool = False) -> None:
     session finishes the way it started, whichever shortcut stops it.
     """
     if not claim_recorder_slot():
-        notify("🎙️ Dictation", "Already recording.", "audio-input-microphone", "chatter")
+        # Only say "already recording" when something actually is: a claim that
+        # failed for any other reason (an unwritable runtime dir) is a fault, and
+        # reporting it as normal contention is how a broken key looks like a
+        # working one.
+        if active_recorder_pid():
+            notify("🎙️ Dictation", "Already recording.", "audio-input-microphone", "chatter")
+        else:
+            notify("⚠️ Dictation", f"Could not start — see {state_dir() / 'debug.log'}",
+                   "dialog-warning", "problem")
         return
 
     try:
@@ -1104,9 +1187,20 @@ def transcribe(cfg: dict, audio_path: Path, model: str | None = None) -> str:
     return result
 
 
+# Apostrophes are dropped rather than spaced: engines disagree about them
+# constantly ("let's" vs "lets"), and a split into "let s" is the difference
+# between two engines agreeing outright and paying for a judge call that can
+# rewrite the text. Every other punctuation mark becomes a space, so
+# "state-of-the-art" still matches "state of the art".
+_APOSTROPHES = "'\u2019\u02bc"
+
+
 def norm_text(text: str) -> str:
     """Compare transcripts ignoring case, punctuation, and whitespace."""
-    kept = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in text.lower())
+    kept = "".join(
+        "" if ch in _APOSTROPHES else ch if ch.isalnum() or ch.isspace() else " "
+        for ch in text.lower()
+    )
     return " ".join(kept.split())
 
 
@@ -1290,8 +1384,15 @@ def ensemble_transcribe(cfg: dict, audio_path: Path) -> tuple[str, str, dict]:
     grace_deadline: float | None = None
     while any(t.is_alive() for t in threads):
         now = time.monotonic()
-        if grace_deadline is None and results:
-            grace_deadline = now + ENSEMBLE_GRACE_SEC
+        if grace_deadline is None:
+            # A *transcript* starts the clock, not merely a returned engine. An
+            # engine that answers instantly with nothing (an empty result — a
+            # scope-less Deepgram key returns one) is no more an answer in hand
+            # than an error is, and letting it start the grace period abandons
+            # the engines still working on the real text six seconds later.
+            with lock:
+                if any(text.strip() for text in results.values()):
+                    grace_deadline = now + ENSEMBLE_GRACE_SEC
         if now >= (grace_deadline if grace_deadline is not None else first_deadline):
             break
         time.sleep(0.05)
@@ -1636,11 +1737,8 @@ def stop(cfg: dict) -> None:
     _wait_recorder_exit(pid)
     # Safety net for a recorder we had to SIGKILL (it never ran its own cleanup).
     # Scoped to the pid we killed so it can't clear a fresh recorder's claim.
-    try:
-        if int(PID_PATH.read_text().strip()) == pid:
-            PID_PATH.unlink(missing_ok=True)
-    except (FileNotFoundError, ValueError, OSError):
-        pass
+    if _slot_owner() == pid:
+        PID_PATH.unlink(missing_ok=True)
 
     if cfg["stt_backend"] == "deepgram":
         text = TRANSCRIPT_PATH.read_text(encoding="utf-8").strip() if TRANSCRIPT_PATH.exists() else ""

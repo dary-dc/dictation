@@ -202,21 +202,38 @@ uv run dictation.py toggle --quiet          # = --notify none
 
 ## Debugging
 
-```bash
-uv run dictation.py toggle --debug
-```
-
-`--debug` (or `debug = true` in config) writes timestamped logs — device name,
-captured duration, Groq request timing, transcript length, clipboard tool, and full
-tracebacks — to **stderr** and to:
+The log is **always** written, whether or not you asked for it:
 
 ```
 ~/.local/state/dictation/debug.log
 ```
 
-Even notifications that the current level *suppresses* are logged, so you can see
-exactly what happened. To debug the hotkey path, temporarily add `--debug` to the
-shortcut command (Option C above) and `tail -f ~/.local/state/dictation/debug.log`.
+Timestamped lines — device name, captured duration, request timing per engine,
+which engines won the vote, transcript length, clipboard tool and verification,
+and full tracebacks — rotated at 1 MB (one previous file kept). A hotkey tool
+fails when nobody is watching a terminal, and a flag you have to switch on first
+is never on at the moment it matters, so the evidence is there before the fact.
+Even notifications that the current level *suppresses* are logged.
+
+```bash
+uv run dictation.py toggle --debug
+```
+
+`--debug` (or `debug = true` in config) adds the same lines on **stderr**, plus
+the noisy per-block audio-callback detail that is kept out of the file. To watch
+the hotkey path live: `tail -f ~/.local/state/dictation/debug.log`.
+
+### Tests
+
+```bash
+python3 test_dictation.py        # no dependencies, no mic, no network
+```
+
+Covers the logic that has actually lost a dictation: the PID-file claim that
+decides whether a second recorder starts, how long the ensemble waits for its
+engines, the majority vote, and the hallucinated-tail stripper. Recording,
+uploading and pasting are left to `doctor` and the log — mocking a microphone
+would only test the mock.
 
 ### Why it copies instead of typing for you
 
@@ -299,6 +316,7 @@ rm -rf ~/.local/share/uv
 | `setup.sh` | Bootstrap `.venv`, run doctor, install shortcuts |
 | `config.example.toml` | Copy to `~/.config/dictation/config.toml` |
 | `install-shortcuts.py` | Register/remove GNOME keyboard shortcuts |
+| `test_dictation.py` | Tests for the offline logic — `python3 test_dictation.py` |
 | `.gitignore` | Keeps a real `config.toml` out of version control |
 | `LICENSE` | MIT |
 
