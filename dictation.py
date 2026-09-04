@@ -64,7 +64,9 @@ RESEND_HINT = "Super+Shift+D to resend last recording."
 DG_KEEPALIVE_SEC = 4.0        # Deepgram WebSocket keepalive interval
 PARTIAL_NOTIFY_SEC = 0.8      # throttle live partial desktop notifications
 JUDGE_TIMEOUT_SEC = 6.0       # cap on the Gemini ensemble-judge call
-ENSEMBLE_WAIT_SEC = 6.0       # max wait for a slow engine before proceeding without it
+ENSEMBLE_GRACE_SEC = 6.0      # extra wait for stragglers once one engine has answered
+ENSEMBLE_MIN_WAIT_SEC = 20.0  # floor on waiting for the *first* engine to answer
+ENSEMBLE_MAX_WAIT_SEC = 90.0  # ceiling on the same, for very long recordings
 
 # Whisper pads trailing silence with YouTube-ish boilerplate; strip it from a
 # transcription's tail. Kept conservative — only phrases nobody dictates.
@@ -87,6 +89,8 @@ NOTIFY_LEVELS = {
     "errors": {"problem"},
     "none": set(),
 }
+
+LOG_MAX_BYTES = 1_000_000  # rotate ~/.local/state/dictation/debug.log at ~1 MB
 
 # Runtime knobs, set once by configure() from config + CLI flags.
 _notify_level = "all"
@@ -240,31 +244,47 @@ def configure(level: str, debug: bool) -> None:
 
 
 def log(msg: str) -> None:
-    """Write a timestamped line to stderr and the debug log — only when --debug."""
-    if not _debug:
-        return
+    """Timestamped line to the rolling log file; also to stderr under --debug.
+
+    The file is written whether or not --debug is set. A keyboard-driven tool
+    fails when nobody is watching a terminal, and --debug is never already on
+    at the moment it matters — so the log has to be there before the fact.
+    Rotates at LOG_MAX_BYTES, keeping one previous file.
+    """
     from datetime import datetime
 
     line = f"{datetime.now().isoformat(timespec='milliseconds')} [pid {os.getpid()}] {msg}"
-    print(line, file=sys.stderr)
+    if _debug:
+        print(line, file=sys.stderr)
     try:
-        with open(state_dir() / "debug.log", "a", encoding="utf-8") as fh:
+        path = state_dir() / "debug.log"
+        if path.exists() and path.stat().st_size > LOG_MAX_BYTES:
+            path.replace(path.with_name("debug.log.1"))
+        with open(path, "a", encoding="utf-8") as fh:
             fh.write(line + "\n")
     except Exception:
         pass
+
+
+def log_debug(msg: str) -> None:
+    """Debug-only line. For hot paths — the PortAudio callback must not do file
+    I/O on every block, or logging itself would cause the dropouts it reports."""
+    if _debug:
+        log(msg)
 
 
 # --------------------------------------------------------------------------- #
 # Desktop integration: notifications & clipboard
 # --------------------------------------------------------------------------- #
 def notify(title: str, body: str = "", icon: str = "audio-input-microphone",
-           category: str = "chatter") -> None:
+           category: str = "chatter", *, force: bool = False) -> None:
     """Send a desktop notification if the current level permits the category.
 
     Safe with arbitrary text (no shell). Every notification is logged in debug
-    mode, even when the level suppresses it.
+    mode, even when the level suppresses it. ``force=True`` always shows — for
+    explicit user actions like resend where silence reads as "broken".
     """
-    allowed = category in NOTIFY_LEVELS.get(_notify_level, set())
+    allowed = force or category in NOTIFY_LEVELS.get(_notify_level, set())
     log(f"notify[{category}] {'show' if allowed else 'suppressed'}: {title} — {body}")
     if not allowed or not shutil.which("notify-send"):
         return
@@ -283,10 +303,47 @@ def notify(title: str, body: str = "", icon: str = "audio-input-microphone",
         pass
 
 
+# Given no --type, wl-copy guesses the MIME type from the content with file(1),
+# and the guess is wrong for ordinary prose: a transcript starting with "From "
+# looks like an mbox, so the selection advertises only "application/mbox" and
+# every normal paste target — which asks for text/plain — silently gets nothing.
+# Naming the type also makes wl-copy offer the text/plain;charset=utf-8, TEXT,
+# STRING and UTF8_STRING aliases. xclip/xsel don't sniff, so they need no flag.
+CLIPBOARD_TYPE = "text/plain"
+
+
+def _wayland_clipboard_holds(text: str) -> bool:
+    """Read the clipboard back and confirm it serves `text` as plain text.
+
+    Fails open: only a successful read of *different* content, or wl-paste
+    refusing the type (exactly how the mbox mis-sniff shows up), counts as a
+    failure. A missing tool, timeout or crash leaves the copy reported as ok.
+    """
+    if not shutil.which("wl-paste"):
+        return True
+    try:
+        proc = subprocess.run(
+            ["wl-paste", "--no-newline", "--type", CLIPBOARD_TYPE],
+            capture_output=True, timeout=5,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"clipboard: verify skipped ({exc})")
+        return True
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        log(f"clipboard: verify failed rc={proc.returncode} {err}")
+        return False
+    got = proc.stdout.decode("utf-8", "replace")
+    if got.strip() != text.strip():
+        log(f"clipboard: verify mismatch — holds {len(got)} chars, expected {len(text)}")
+        return False
+    return True
+
+
 def copy_to_clipboard(text: str) -> bool:
     """Copy text to the clipboard. Prefers Wayland (wl-copy), falls back to X11."""
     candidates = [
-        ("wl-copy", ["wl-copy"]),
+        ("wl-copy", ["wl-copy", "--type", CLIPBOARD_TYPE]),
         ("xclip", ["xclip", "-selection", "clipboard"]),
         ("xsel", ["xsel", "--clipboard", "--input"]),
     ]
@@ -301,11 +358,14 @@ def copy_to_clipboard(text: str) -> bool:
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     start_new_session=True,
                 )
-                log(f"clipboard: copied {len(text)} chars via {tool}")
-                return True
             except subprocess.CalledProcessError as exc:
                 log(f"clipboard: {tool} failed: {exc}")
                 continue
+            if tool == "wl-copy" and not _wayland_clipboard_holds(text):
+                log("clipboard: wl-copy reported success but clipboard is unusable")
+                return False
+            log(f"clipboard: copied {len(text)} chars via {tool}")
+            return True
     log("clipboard: no working tool found")
     return False
 
@@ -340,6 +400,42 @@ def active_recorder_pid() -> int | None:
         PID_PATH.unlink(missing_ok=True)  # stale
         return None
     return pid
+
+
+def claim_recorder_slot() -> bool:
+    """Atomically claim the recorder slot. False if a live recorder already holds it.
+
+    O_EXCL makes the claim one indivisible step. Checking active_recorder_pid()
+    and then writing the file is not: the gap spans the sounddevice/Qt imports
+    (~1 s), so two presses of the toggle key both passed the check and both
+    recorded. The loser overwrote the PID file, orphaning the winner — a
+    recorder still holding the microphone that no stop/toggle could ever reach.
+    """
+    for _ in range(2):
+        try:
+            fd = os.open(PID_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            # Either a live recorder owns it, or it is stale — active_recorder_pid()
+            # tells the two apart and clears a stale file, so the retry can win it.
+            if active_recorder_pid() is not None:
+                return False
+            continue
+        except OSError as exc:
+            log(f"recorder slot claim failed: {exc}")
+            return False
+        with os.fdopen(fd, "w") as fh:
+            fh.write(str(os.getpid()))
+        return True
+    return False
+
+
+def release_recorder_slot() -> None:
+    """Drop the PID file only if it is still ours — never steal another recorder's."""
+    try:
+        if int(PID_PATH.read_text().strip()) == os.getpid():
+            PID_PATH.unlink(missing_ok=True)
+    except (FileNotFoundError, ValueError, OSError):
+        pass
 
 
 def _release_audio() -> None:
@@ -381,7 +477,7 @@ def record(cfg: dict, simple: bool = False) -> None:
     single-pass transcription. The mode is remembered in MODE_PATH so the
     session finishes the way it started, whichever shortcut stops it.
     """
-    if active_recorder_pid():
+    if not claim_recorder_slot():
         notify("🎙️ Dictation", "Already recording.", "audio-input-microphone", "chatter")
         return
 
@@ -390,14 +486,19 @@ def record(cfg: dict, simple: bool = False) -> None:
     except OSError:
         pass
 
-    if simple:
-        record_groq(cfg)
-    elif cfg["stt_backend"] == "deepgram":
-        record_deepgram(cfg)
-    elif cfg["overlay"]:
-        record_overlay(cfg)
-    else:
-        record_groq(cfg)
+    # The slot is held for the whole session and released here — including on
+    # the early returns inside the recorders (e.g. Deepgram with no API key).
+    try:
+        if simple:
+            record_groq(cfg)
+        elif cfg["stt_backend"] == "deepgram":
+            record_deepgram(cfg)
+        elif cfg["overlay"]:
+            record_overlay(cfg)
+        else:
+            record_groq(cfg)
+    finally:
+        release_recorder_slot()
 
 
 def record_groq(cfg: dict) -> None:
@@ -419,12 +520,10 @@ def record_groq(cfg: dict) -> None:
 
     def callback(indata, frames, time_info, status):  # noqa: ARG001
         if status:
-            log(f"audio status: {status}")
+            log_debug(f"audio status: {status}")
         audio_q.put(indata.copy())
 
-    AUDIO_PATH.unlink(missing_ok=True)
-    # Claim the lock as early as possible so a fast second press routes to "stop".
-    PID_PATH.write_text(str(os.getpid()))
+    AUDIO_PATH.unlink(missing_ok=True)  # the slot is already claimed by record()
     frames_written = 0
 
     try:
@@ -463,7 +562,6 @@ def record_groq(cfg: dict) -> None:
         notify("❌ Dictation", f"Recording failed: {exc}", "dialog-error", "problem")
     finally:
         _release_audio()
-        PID_PATH.unlink(missing_ok=True)
 
 
 def record_overlay(cfg: dict) -> None:
@@ -501,14 +599,13 @@ def record_overlay(cfg: dict) -> None:
     signal.signal(signal.SIGINT, request_stop)
 
     AUDIO_PATH.unlink(missing_ok=True)
-    PID_PATH.write_text(str(os.getpid()))
 
     events: queue.Queue[tuple] = queue.Queue()  # ("partial"|"final"|"quit", text)
     audio_q: queue.Queue = queue.Queue()
 
     def callback(indata, frames, time_info, status):  # noqa: ARG001
         if status:
-            log(f"audio status: {status}")
+            log_debug(f"audio status: {status}")
         audio_q.put(indata.copy())
 
     # Live-lane state. The Deepgram connection is strictly display-side and
@@ -804,7 +901,6 @@ def record_overlay(cfg: dict) -> None:
         app.exec()
     finally:
         _release_audio()
-        PID_PATH.unlink(missing_ok=True)
 
 
 def record_deepgram(cfg: dict) -> None:
@@ -841,7 +937,7 @@ def record_deepgram(cfg: dict) -> None:
 
     def callback(indata, frames, time_info, status):  # noqa: ARG001
         if status:
-            log(f"audio status: {status}")
+            log_debug(f"audio status: {status}")
         audio_q.put(indata.copy())
 
     def maybe_notify_partial(text: str) -> None:
@@ -856,7 +952,6 @@ def record_deepgram(cfg: dict) -> None:
         notify("🎙️ Live dictation", preview, "audio-input-microphone", "chatter")
 
     TRANSCRIPT_PATH.unlink(missing_ok=True)
-    PID_PATH.write_text(str(os.getpid()))
 
     connect_kwargs: dict = {
         "model": cfg["model"] or "nova-3",
@@ -981,7 +1076,6 @@ def record_deepgram(cfg: dict) -> None:
         notify("❌ Dictation", f"Deepgram recording failed: {exc}", "dialog-error", "problem")
     finally:
         _release_audio()
-        PID_PATH.unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -1121,55 +1215,93 @@ def ensemble_transcribe(cfg: dict, audio_path: Path) -> tuple[str, str, dict]:
     Voters: Groq whisper-large-v3, Groq turbo (fast, nearly free), Deepgram
     nova-3. Hallucinated tails are stripped from every hypothesis. If two
     voters agree the result is used directly (no judge latency, no invention
-    risk); a slow engine is abandoned after ENSEMBLE_WAIT_SEC. Returns
+    risk); a straggler is abandoned ENSEMBLE_GRACE_SEC after the first
+    answer lands, never before one has. Returns
     (text, how, report) — the report feeds the lab (dictation.py lab).
     """
     started = time.monotonic()
     results: dict[str, str] = {}
     errors: dict[str, str] = {}
     report: dict = {"engines": {}}
+    # Engine threads and the abandon sweep below both write these, so the
+    # "has this engine been written off yet?" check and the write that follows
+    # it have to be one step — otherwise a result can land in `results` after
+    # the sweep has already recorded the engine as abandoned.
+    lock = threading.Lock()
 
     def run(name: str, fn) -> None:
         t0 = time.monotonic()
         try:
             text = fn()
         except Exception as exc:  # noqa: BLE001
-            errors[name] = str(exc)
-            if name not in report["engines"]:
-                report["engines"][name] = {
-                    "seconds": round(time.monotonic() - t0, 2),
-                    "error": str(exc),
-                }
+            with lock:
+                errors[name] = str(exc)
+                if name not in report["engines"]:
+                    report["engines"][name] = {
+                        "seconds": round(time.monotonic() - t0, 2),
+                        "error": str(exc),
+                    }
             log(f"ensemble {name} failed: {exc}")
             return
         # A timed-out engine may finish late — don't mutate the report then.
-        if name not in report["engines"]:
-            results[name] = text
-            report["engines"][name] = {
-                "seconds": round(time.monotonic() - t0, 2),
-                "text": text,
-            }
+        with lock:
+            if name not in report["engines"]:
+                results[name] = text
+                report["engines"][name] = {
+                    "seconds": round(time.monotonic() - t0, 2),
+                    "text": text,
+                }
 
     ens_model = cfg["ensemble_model"]
     fast_model = cfg["model"]
     names = [f"groq {ens_model}", "deepgram nova-3"]
+    # daemon: an abandoned engine's answer is discarded anyway, so it must not
+    # keep the process alive after the text is already on the clipboard.
     threads = [
-        threading.Thread(target=run, args=(names[0], lambda: transcribe(cfg, audio_path, ens_model))),
-        threading.Thread(target=run, args=(names[1], lambda: transcribe_deepgram_batch(cfg, audio_path))),
+        threading.Thread(target=run, args=(names[0], lambda: transcribe(cfg, audio_path, ens_model)), daemon=True),
+        threading.Thread(target=run, args=(names[1], lambda: transcribe_deepgram_batch(cfg, audio_path)), daemon=True),
     ]
     if fast_model != ens_model:
         names.append(f"groq {fast_model}")
         threads.append(
-            threading.Thread(target=run, args=(names[2], lambda: transcribe(cfg, audio_path, fast_model)))
+            threading.Thread(
+                target=run, args=(names[2], lambda: transcribe(cfg, audio_path, fast_model)), daemon=True
+            )
         )
     for t in threads:
         t.start()
-    deadline = time.monotonic() + ENSEMBLE_WAIT_SEC
-    for name, t in zip(names, threads):
-        t.join(timeout=max(0.1, deadline - time.monotonic()))
-        if t.is_alive() and name not in report["engines"]:
-            report["engines"][name] = {"error": f"abandoned after {ENSEMBLE_WAIT_SEC:.0f}s"}
-            log(f"ensemble {name} abandoned after {ENSEMBLE_WAIT_SEC:.0f}s")
+
+    # Two-phase wait. A single flat deadline made long dictations fail outright:
+    # on a 392 s recording every engine was still uploading at 6 s, all three
+    # were written off, and ensemble_transcribe raised "all engines failed" —
+    # while the text they returned moments later was thrown away. The cap was
+    # only ever meant to stop a straggler adding latency to a result already in
+    # hand, so it now starts counting from the first answer. Until then we wait,
+    # scaled by how much audio there is to upload and decode.
+    # The grace clock starts on the first real transcript, never on an engine
+    # that merely errored out — otherwise one instant failure (a bad Deepgram
+    # key) would cut short the engine that was about to answer correctly.
+    # Engines that all fail fast still return fast: the loop ends as soon as no
+    # thread is alive, so the wait below only ever applies to a genuine hang.
+    audio_seconds = audio_path.stat().st_size / (SAMPLE_RATE * 2)
+    first_deadline = time.monotonic() + min(
+        ENSEMBLE_MAX_WAIT_SEC, max(ENSEMBLE_MIN_WAIT_SEC, audio_seconds)
+    )
+    grace_deadline: float | None = None
+    while any(t.is_alive() for t in threads):
+        now = time.monotonic()
+        if grace_deadline is None and results:
+            grace_deadline = now + ENSEMBLE_GRACE_SEC
+        if now >= (grace_deadline if grace_deadline is not None else first_deadline):
+            break
+        time.sleep(0.05)
+
+    waited = time.monotonic() - started
+    with lock:
+        for name, t in zip(names, threads):
+            if t.is_alive() and name not in report["engines"]:
+                report["engines"][name] = {"error": f"abandoned after {waited:.0f}s"}
+                log(f"ensemble {name} abandoned after {waited:.0f}s")
 
     def finish(text: str, how: str) -> tuple[str, str, dict]:
         report["final"] = {"text": text, "via": how}
@@ -1423,15 +1555,16 @@ def deliver_text(cfg: dict, text: str, *, resend: bool = False) -> bool:
         mark_clipboard_ok()
         preview = text if len(text) <= 60 else text[:57] + "…"
         title = "📋 Resent — ready to paste" if resend else "📋 Transcribed — ready to paste"
-        notify(title, preview, "emblem-ok", "done")
+        notify(title, preview, "emblem-ok", "done", force=resend)
         print(text)
         return True
 
     notify(
         "⚠️ Dictation",
-        f"Transcribed, but clipboard failed (install wl-clipboard). {RESEND_HINT}",
+        f"Transcribed, but the clipboard did not take it. {RESEND_HINT}",
         "dialog-warning",
         "problem",
+        force=resend,
     )
     print(text)
     return False
@@ -1501,7 +1634,13 @@ def stop(cfg: dict) -> None:
         pass
 
     _wait_recorder_exit(pid)
-    PID_PATH.unlink(missing_ok=True)
+    # Safety net for a recorder we had to SIGKILL (it never ran its own cleanup).
+    # Scoped to the pid we killed so it can't clear a fresh recorder's claim.
+    try:
+        if int(PID_PATH.read_text().strip()) == pid:
+            PID_PATH.unlink(missing_ok=True)
+    except (FileNotFoundError, ValueError, OSError):
+        pass
 
     if cfg["stt_backend"] == "deepgram":
         text = TRANSCRIPT_PATH.read_text(encoding="utf-8").strip() if TRANSCRIPT_PATH.exists() else ""
@@ -1520,7 +1659,12 @@ def stop(cfg: dict) -> None:
     log(f"captured audio: {size} bytes")
     if size < MIN_AUDIO_BYTES:
         AUDIO_PATH.unlink(missing_ok=True)
-        notify("⚠️ Dictation", "No audio captured.", "dialog-warning", "problem")
+        notify(
+            "⚠️ Dictation",
+            f"Recording too short — speak longer, then stop. {RESEND_HINT}",
+            "dialog-warning",
+            "problem",
+        )
         return
 
     try:
@@ -1538,7 +1682,13 @@ def stop(cfg: dict) -> None:
 def resend(cfg: dict) -> None:
     """Re-transcribe or re-copy the last saved recording after a failure."""
     if active_recorder_pid():
-        notify("🎙️ Dictation", "Still recording — stop first.", "dialog-information", "chatter")
+        notify(
+            "🎙️ Dictation",
+            "Still recording — stop first.",
+            "dialog-warning",
+            "problem",
+            force=True,
+        )
         return
 
     meta = load_last_meta()
@@ -1548,14 +1698,26 @@ def resend(cfg: dict) -> None:
         text = LAST_TXT_PATH.read_text(encoding="utf-8").strip()
         if text:
             log("resend: copying saved transcript (clipboard-only)")
-            notify("🔄 Dictation", "Copying last transcript…", "emblem-synchronizing", "chatter")
+            notify(
+                "🔄 Dictation",
+                "Copying last transcript…",
+                "emblem-synchronizing",
+                "start",
+                force=True,
+            )
             deliver_text(cfg, text, resend=True)
             return
 
     if has_wav:
         mode = str(meta.get("mode") or "full")
         log(f"resend: re-transcribing last.wav mode={mode}")
-        notify("🔄 Dictation", "Re-transcribing last recording…", "emblem-synchronizing", "chatter")
+        notify(
+            "🔄 Dictation",
+            "Re-transcribing last recording…",
+            "emblem-synchronizing",
+            "start",
+            force=True,
+        )
         finish_wav_session(cfg, LAST_WAV_PATH, mode, save_recording=False, resend=True)
         return
 
@@ -1563,15 +1725,22 @@ def resend(cfg: dict) -> None:
         text = LAST_TXT_PATH.read_text(encoding="utf-8").strip()
         if text:
             log("resend: copying saved transcript (no WAV)")
-            notify("🔄 Dictation", "Copying last transcript…", "emblem-synchronizing", "chatter")
+            notify(
+                "🔄 Dictation",
+                "Copying last transcript…",
+                "emblem-synchronizing",
+                "start",
+                force=True,
+            )
             deliver_text(cfg, text, resend=True)
             return
 
     notify(
         "🎙️ Dictation",
         "No previous recording to resend.",
-        "dialog-information",
-        "chatter",
+        "dialog-warning",
+        "problem",
+        force=True,
     )
 
 
@@ -1661,7 +1830,9 @@ def doctor(cfg: dict) -> bool:
 
     clip = next((t for t in ("wl-copy", "xclip", "xsel") if shutil.which(t)), None)
     if clip:
-        print(f"[ok] clipboard tool: {clip}")
+        print(f"[ok] clipboard tool: {clip} (copying as {CLIPBOARD_TYPE})")
+        if clip == "wl-copy" and not shutil.which("wl-paste"):
+            print("[--] wl-paste missing — copies can't be verified after writing")
     else:
         ok = False
         print("[!!] no clipboard tool — install wl-clipboard")
@@ -1673,6 +1844,9 @@ def doctor(cfg: dict) -> bool:
 
     print(f"[..] save_history={cfg['save_history']}  save_last_recording={cfg['save_last_recording']}")
     print(f"[..] notifications={_notify_level}  debug={_debug}")
+    rec_pid = active_recorder_pid()
+    if rec_pid:
+        print(f"[..] recording right now (pid {rec_pid}) — stop it with: dictation.py stop")
     if cfg["save_last_recording"] and LAST_WAV_PATH.is_file():
         meta = load_last_meta()
         size = LAST_WAV_PATH.stat().st_size

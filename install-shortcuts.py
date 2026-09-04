@@ -68,6 +68,34 @@ def free_path(existing: list[str]) -> str:
     return f"{BASE}/custom{i}/"
 
 
+def item_name(path: str) -> str:
+    try:
+        return ast.literal_eval(gset_get(ITEM_SCHEMA, "name", path))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def is_dictation_shortcut(path: str, script: Path) -> bool:
+    name = item_name(path)
+    cmd = item_command(path)
+    script_str = str(script)
+    return (
+        name.startswith("Dictation:")
+        or script_str in cmd
+        or "dictation.py" in cmd
+    )
+
+
+def remove_all_dictation(script: Path) -> int:
+    """Drop every dictation shortcut (any command variant) so re-runs never duplicate."""
+    paths = get_list()
+    keep = [p for p in paths if not is_dictation_shortcut(p, script)]
+    removed = len(paths) - len(keep)
+    if removed:
+        gset_set(SCHEMA, LIST_KEY, repr(keep) if keep else "@as []")
+    return removed
+
+
 def upsert(name: str, command: str, binding: str) -> None:
     """Create or update the custom shortcut whose command matches `command`."""
     paths = get_list()
@@ -82,11 +110,8 @@ def upsert(name: str, command: str, binding: str) -> None:
     print(f"  • {name!r}  [{binding}]  →  {command}")
 
 
-def remove(commands: list[str]) -> None:
-    paths = get_list()
-    keep = [p for p in paths if item_command(p) not in commands]
-    removed = len(paths) - len(keep)
-    gset_set(SCHEMA, LIST_KEY, repr(keep) if keep else "@as []")
+def remove(commands: list[str], script: Path) -> None:
+    removed = remove_all_dictation(script)
     print(f"Removed {removed} dictation shortcut(s).")
 
 
@@ -123,8 +148,12 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.remove:
-        remove([cmd_toggle, cmd_simple, cmd_start, cmd_stop, cmd_resend])
+        remove([], script)
         return 0
+
+    stale = remove_all_dictation(script)
+    if stale:
+        print(f"Removed {stale} stale dictation shortcut(s).")
 
     if args.mode == "toggle":
         print("Installing toggle shortcuts:")
