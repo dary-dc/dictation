@@ -26,14 +26,25 @@ stop it.
   both auto-reused from Bridge/web-agent): the WAV is transcribed by three
   engines in parallel (Groq whisper-large-v3, Groq turbo, Deepgram nova-3),
   hallucinated tails are stripped, and majority wording wins — a Gemini judge
-  reconstructs only genuine three-way disagreements. Slow engines are
-  abandoned after ~6 s. Set `ensemble = false` for the old instant single pass.
+  reconstructs only genuine three-way disagreements. A straggler is abandoned
+  6 s after the *first* engine answers, never before one has, so a long
+  recording is never cut off mid-upload. Set `ensemble = false` for the old
+  instant single pass.
 - **Last recording recovery** (`save_last_recording = true`): each dictation
   saves `last.wav` under `~/.local/state/dictation/` before transcribing. If
   transcription or clipboard fails, press **Super + Shift + D** (or
   `dictation.py resend`) to retry — no re-speaking. Transient API errors
   auto-retry twice; clipboard-only retry is instant when a transcript was
   already saved.
+- **A crash cannot take the audio with it.** The recording is the one thing a
+  session cannot reconstruct, so no failure path deletes it: a recorder that
+  throws mid-session saves what it captured to the recovery slot first, a
+  recorder killed outright leaves a file the next press rescues rather than
+  overwrites, and a WAV whose header was never finalised (a hard kill) is
+  repaired from the file itself instead of reaching the engines as an empty
+  recording. If the microphone stops delivering audio — a suspended USB mic, a
+  PipeWire restart, a Bluetooth profile switch — you are told within ~3 s
+  rather than finding a short transcript at the end.
 - **Quality lab** (`lab = true`): the last 20 dictations keep their audio and
   an engine-by-engine record — run `uv run dictation.py lab` to compare what
   each engine heard vs. what reached your clipboard.
@@ -284,6 +295,13 @@ See `config.example.toml`. Notable options:
   run `doctor` once to warm the cache.
 - **Shortcut does nothing** — the key combo may already be taken; change it in
   *Settings → Keyboard → Custom Shortcuts*.
+- **"The recorder captured nothing"** — the recorder started but no audio reached
+  the WAV (a device held by another app, a mic that vanished mid-session, a
+  crash). `debug.log` has the traceback or the stall warning; anything that
+  *was* captured is in the recovery slot, so try **Super + Shift + D** first.
+- **A recording ended before you stopped speaking** — the mic stopped delivering
+  audio mid-session. `doctor` reports an interrupted recording still waiting,
+  and the log timestamps the gap.
 - **Resend keeps copying a bad transcript** — delete `~/.local/state/dictation/last.txt`
   and press **Super + Shift + D** again to force a full re-transcription from
   `last.wav`.

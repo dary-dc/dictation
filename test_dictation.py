@@ -145,6 +145,126 @@ class RecorderSlot(unittest.TestCase):
         self.assertTrue(d.PID_PATH.exists(), "released a slot we do not own")
 
 
+class RescuingAudio(unittest.TestCase):
+    """The recording is the one thing a session cannot reconstruct, so no
+    failure path may delete it. A crash three minutes in used to do exactly
+    that, and stop() then reported it as a recording that was too short."""
+
+    SECONDS = 120
+
+    def setUp(self):
+        self.cfg = {"save_last_recording": True}
+        for path in (d.AUDIO_PATH, d.LAST_WAV_PATH, d.LAST_TXT_PATH, d.LAST_META_PATH):
+            path.unlink(missing_ok=True)
+            self.addCleanup(path.unlink, True)
+
+    def _record(self, path=None, seconds=None):
+        import wave
+
+        path = path or d.AUDIO_PATH
+        with wave.open(str(path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(d.SAMPLE_RATE)
+            w.writeframes(b"\x01\x02" * (d.SAMPLE_RATE * (seconds or self.SECONDS)))
+        return path
+
+    def _readable_seconds(self, path):
+        import wave
+
+        with wave.open(str(path), "rb") as w:
+            return w.getnframes() / w.getframerate()
+
+    def test_a_crash_keeps_the_audio_it_captured(self):
+        self._record()
+        d.report_recorder_failure(self.cfg, RuntimeError("PortAudio: device disconnected"))
+        self.assertFalse(d.AUDIO_PATH.exists(), "working file should be cleared once saved")
+        self.assertEqual(self._readable_seconds(d.LAST_WAV_PATH), self.SECONDS)
+        self.assertTrue(d.last_wav_matches_meta(), "resend must be able to pick it up")
+
+    def test_a_killed_recorders_file_is_repaired_not_read_as_empty(self):
+        # libsndfile writes the lengths on close, so a SIGKILL leaves every
+        # sample on disk behind a header claiming none of them.
+        self._record()
+        with open(d.AUDIO_PATH, "r+b") as fh:
+            fh.seek(4)
+            fh.write((36).to_bytes(4, "little"))
+            fh.seek(40)
+            fh.write((0).to_bytes(4, "little"))
+        self.assertEqual(self._readable_seconds(d.AUDIO_PATH), 0.0)
+        self.assertTrue(d.repair_wav_header(d.AUDIO_PATH))
+        self.assertEqual(self._readable_seconds(d.AUDIO_PATH), self.SECONDS)
+
+    def test_repair_leaves_a_healthy_file_untouched(self):
+        self._record(seconds=1)
+        before = d.AUDIO_PATH.read_bytes()
+        self.assertFalse(d.repair_wav_header(d.AUDIO_PATH))
+        self.assertEqual(d.AUDIO_PATH.read_bytes(), before)
+
+    def test_the_next_press_rescues_what_a_dead_recorder_left(self):
+        self._record()
+        d.rescue_orphaned_recording(self.cfg)
+        self.assertFalse(d.AUDIO_PATH.exists())
+        self.assertEqual(self._readable_seconds(d.LAST_WAV_PATH), self.SECONDS)
+
+    def test_with_the_slot_off_the_only_copy_is_set_aside_not_deleted(self):
+        self.addCleanup(d.ORPHAN_PATH.unlink, True)
+        self._record()
+        d.rescue_orphaned_recording({"save_last_recording": False})
+        self.assertFalse(d.AUDIO_PATH.exists(), "the recorder needs the name free")
+        self.assertEqual(self._readable_seconds(d.ORPHAN_PATH), self.SECONDS)
+        self.assertFalse(d.LAST_WAV_PATH.exists(), "wrote audio the user asked not to keep")
+
+    def test_a_genuinely_tiny_take_is_not_hoarded(self):
+        d.AUDIO_PATH.write_bytes(b"\0" * 100)
+        self.assertEqual(d.preserve_recording(self.cfg, d.AUDIO_PATH, "tiny"), (0.0, False))
+        d.rescue_orphaned_recording(self.cfg)
+        self.assertFalse(d.AUDIO_PATH.exists())
+
+
+class SettledText(unittest.TestCase):
+    """What the streaming backend has to show for itself when it falls over."""
+
+    def test_joins_finals_and_keeps_an_unclosed_partial(self):
+        self.assertEqual(d.settled_text(["One two.", "Three."], "four fi"),
+                         "One two. Three. four fi")
+
+    def test_drops_a_partial_already_contained_in_the_finals(self):
+        self.assertEqual(d.settled_text(["One two three."], "two three"), "One two three.")
+
+    def test_a_partial_alone_still_counts(self):
+        self.assertEqual(d.settled_text([], "half a sentence"), "half a sentence")
+        self.assertEqual(d.settled_text([], ""), "")
+
+
+class MicrophoneStall(unittest.TestCase):
+    """A device that goes away mid-session raises nothing — the callback just
+    stops. Silence has to be reported while the user can still act on it."""
+
+    def setUp(self):
+        self.notes = []
+        real = d.notify
+        d.notify = lambda title, body="", *a, **k: self.notes.append((title, body))
+        self.addCleanup(setattr, d, "notify", real)
+
+    def test_warns_once_when_audio_stops_then_again_after_it_returns(self):
+        watch = d.StallWatch()
+        watch.check()
+        self.assertEqual(self.notes, [], "should not warn while audio is flowing")
+
+        watch.last -= d.AUDIO_STALL_SEC + 1
+        watch.check()
+        watch.check()
+        self.assertEqual(len(self.notes), 1, "one warning per stall, not one per loop")
+        self.assertIn("microphone", self.notes[0][1].lower())
+
+        watch.saw_audio()
+        self.assertEqual(len(self.notes), 2, "recovery should be reported too")
+        watch.last -= d.AUDIO_STALL_SEC + 1
+        watch.check()
+        self.assertEqual(len(self.notes), 3, "a second stall must warn again")
+
+
 class EnsembleWait(unittest.TestCase):
     """When to stop waiting for engines. Both directions cost a dictation:
     too eager throws away finished text, too patient hangs on a dead engine."""
