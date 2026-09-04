@@ -346,6 +346,7 @@ rm -rf ~/.local/share/uv
 | `config.example.toml` | Copy to `~/.config/dictation/config.toml` |
 | `install-shortcuts.py` | Register/remove GNOME keyboard shortcuts |
 | `test_dictation.py` | Tests for the offline logic — `python3 test_dictation.py` |
+| `TODO.md` | What could be done next, and what is deliberately left alone |
 | `.gitignore` | Keeps a real `config.toml` out of version control |
 | `LICENSE` | MIT |
 
