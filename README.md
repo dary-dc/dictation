@@ -39,12 +39,19 @@ stop it.
 - **A crash cannot take the audio with it.** The recording is the one thing a
   session cannot reconstruct, so no failure path deletes it: a recorder that
   throws mid-session saves what it captured to the recovery slot first, a
-  recorder killed outright leaves a file the next press rescues rather than
+  recorder killed outright leaves a file the next start rescues rather than
   overwrites, and a WAV whose header was never finalised (a hard kill) is
   repaired from the file itself instead of reaching the engines as an empty
   recording. If the microphone stops delivering audio — a suspended USB mic, a
   PipeWire restart, a Bluetooth profile switch — you are told within ~3 s
   rather than finding a short transcript at the end.
+- **Start the next dictation whenever you like.** Every session records to its
+  own file, named for the recorder that owns it, so a transcription still
+  finishing in the background cannot clean up the recording you just started —
+  which is exactly how a three-minute take used to arrive at its own stop as
+  "Recording too short". The clipboard is handed the text rather than waited
+  on, too: on Wayland the copy tool keeps running to serve the selection, and
+  waiting for it to exit once held a session up for half an hour.
 - **Quality lab** (`lab = true`): the last 20 dictations keep their audio and
   an engine-by-engine record — run `uv run dictation.py lab` to compare what
   each engine heard vs. what reached your clipboard.

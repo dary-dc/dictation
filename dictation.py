@@ -57,6 +57,7 @@ from pathlib import Path
 
 SAMPLE_RATE = 16_000          # Whisper expects 16 kHz; mono keeps uploads tiny (~32 KB/s)
 MIN_AUDIO_BYTES = 8_000       # ignore clips shorter than ~0.25 s (accidental double-press)
+MAX_RESCUE_SEC = 1_800.0      # past this an orphan is a stuck recorder, not a lost dictation
 STOP_TIMEOUT = 6.0            # seconds to wait for the recorder to flush & exit
 TRANSCRIBE_RETRIES = 2        # extra attempts on transient API/network errors
 TRANSCRIBE_RETRY_DELAY = 1.5  # seconds between retries
@@ -121,11 +122,37 @@ def state_dir() -> Path:
     return d
 
 
-AUDIO_PATH = runtime_dir() / "recording.wav"
-TRANSCRIPT_PATH = runtime_dir() / "transcript.txt"
 PID_PATH = runtime_dir() / "recorder.pid"
-MODE_PATH = runtime_dir() / "recorder.mode"  # "simple" | "full", set at start
-ORPHAN_PATH = runtime_dir() / "interrupted.wav"  # audio a dead recorder left behind
+
+
+# Everything a session writes is named after the recorder that owns it. One
+# shared "recording.wav" made every session's cleanup everybody's cleanup: stop()
+# deletes the WAV when transcription finishes, which is routinely *after* the
+# next dictation has started — and the file it deleted was that new recording,
+# mid-flight. The recorder kept filling an unlinked inode, logged "closed WAV
+# cleanly: 189.30s captured", and its own stopper then found nothing at all and
+# called it a recording too short to transcribe.
+def session_audio_path(pid: int) -> Path:
+    """The WAV being recorded by `pid`."""
+    return runtime_dir() / f"recording-{pid}.wav"
+
+
+def session_mode_path(pid: int) -> Path:
+    """The mode ("simple" | "full") `pid` started in, so it finishes that way."""
+    return runtime_dir() / f"recorder-{pid}.mode"
+
+
+def session_transcript_path(pid: int) -> Path:
+    """Where `pid` leaves the live transcript (Deepgram streaming backend)."""
+    return runtime_dir() / f"transcript-{pid}.txt"
+
+
+def session_pid_of(path: Path) -> int | None:
+    """The owning pid encoded in a session filename, or None if it is not one."""
+    try:
+        return int(path.stem.rsplit("-", 1)[1])
+    except (IndexError, ValueError):
+        return None
 OVERLAY_STATE = state_dir() / "overlay.json"  # last overlay window geometry
 LAST_WAV_PATH = state_dir() / "last.wav"
 LAST_TXT_PATH = state_dir() / "last.txt"
@@ -317,6 +344,56 @@ def notify(title: str, body: str = "", icon: str = "audio-input-microphone",
 # Naming the type also makes wl-copy offer the text/plain;charset=utf-8, TEXT,
 # STRING and UTF8_STRING aliases. xclip/xsel don't sniff, so they need no flag.
 CLIPBOARD_TYPE = "text/plain"
+CLIPBOARD_HANDOFF_SEC = 3.0   # how long a copy tool gets to fail before we call it served
+
+
+def _hand_to_clipboard_tool(tool: str, cmd: list[str], data: bytes) -> bool:
+    """Give the text to a clipboard tool without waiting for the tool to exit.
+
+    A clipboard tool *is* the clipboard on Wayland: wl-copy keeps running to
+    serve the selection until another app claims it. It usually forks first,
+    but not always — in one session a copy held this process for 31 minutes,
+    ending only when something else took the clipboard, and everything queued
+    behind it (including the cleanup that hands back the recording file) waited
+    with it. Waiting briefly for an *error* is useful; waiting for the daemon to
+    die is not, so a tool still alive after the handoff is treated as serving.
+    """
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        log(f"clipboard: {tool} could not start: {exc}")
+        return False
+
+    def feed() -> None:
+        # In a thread: a tool that never reads would otherwise block the write
+        # itself once the text outgrows the pipe buffer. Closing stdin is what
+        # tells the tool it has the whole text, so it must happen either way.
+        try:
+            proc.stdin.write(data)
+        except OSError as exc:
+            log(f"clipboard: {tool} rejected the text: {exc}")
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
+    writer = threading.Thread(target=feed, name="dictation-clipboard", daemon=True)
+    writer.start()
+    writer.join(CLIPBOARD_HANDOFF_SEC)
+    try:
+        code = proc.wait(timeout=CLIPBOARD_HANDOFF_SEC)
+    except subprocess.TimeoutExpired:
+        log(f"clipboard: {tool} still running after handoff — serving the selection")
+        return True
+    if code != 0:
+        log(f"clipboard: {tool} exited {code}")
+        return False
+    return True
 
 
 def _wayland_clipboard_holds(text: str) -> bool:
@@ -356,17 +433,9 @@ def copy_to_clipboard(text: str) -> bool:
     ]
     for tool, cmd in candidates:
         if shutil.which(tool):
-            try:
-                # wl-copy/xclip/xsel fork a daemon to keep serving the selection.
-                # Detach it and send its stdio to /dev/null so it never holds an
-                # inherited pipe open (which would hang a parent capturing output).
-                subprocess.run(
-                    cmd, input=text.encode("utf-8"), check=True,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-            except subprocess.CalledProcessError as exc:
-                log(f"clipboard: {tool} failed: {exc}")
+            # Detached, with its stdio at /dev/null, so the serving daemon never
+            # holds an inherited pipe open behind us.
+            if not _hand_to_clipboard_tool(tool, cmd, text.encode("utf-8")):
                 continue
             if tool == "wl-copy" and not _wayland_clipboard_holds(text):
                 log("clipboard: wl-copy reported success but clipboard is unusable")
@@ -592,15 +661,15 @@ def repair_wav_header(path: Path) -> bool:
         return False
 
 
-def current_mode() -> str:
-    """The mode the running session started in ("simple" or "full")."""
+def current_mode(pid: int) -> str:
+    """The mode session `pid` started in ("simple" or "full")."""
     try:
-        return MODE_PATH.read_text().strip() or "full"
+        return session_mode_path(pid).read_text().strip() or "full"
     except OSError:
         return "full"
 
 
-def preserve_recording(cfg: dict, wav_path: Path, reason: str) -> tuple[float, bool]:
+def preserve_recording(cfg: dict, wav_path: Path, mode: str, reason: str) -> tuple[float, bool]:
     """Keep whatever audio exists. Returns (seconds kept, is it in the slot?).
 
     (0.0, False) means there was nothing worth keeping — the caller is then free
@@ -614,12 +683,19 @@ def preserve_recording(cfg: dict, wav_path: Path, reason: str) -> tuple[float, b
         if size < MIN_AUDIO_BYTES:
             return 0.0, False
         seconds = size / (SAMPLE_RATE * 2)
+        if seconds > MAX_RESCUE_SEC:
+            # Not a lost dictation — a recorder nobody stopped, left running for
+            # hours. Overwriting the recovery slot with it would throw away the
+            # real last dictation and hand resend an upload no engine accepts.
+            log(f"{reason}: leaving {seconds / 60:.0f} minutes at {wav_path} — too long to be a dictation")
+            return seconds, False
         if cfg.get("save_last_recording", True):
-            save_last_recording(wav_path, current_mode())
+            save_last_recording(wav_path, mode)
             log(f"{reason}: preserved {seconds:.1f}s into the recovery slot")
             return seconds, True
         # The recovery slot is switched off, so leaving the file where it is, is
         # the only way to keep it without persisting audio the user said not to.
+        # Nothing will overwrite it: the name belongs to that session alone.
         log(f"{reason}: kept {seconds:.1f}s at {wav_path} (recovery slot off)")
         return seconds, False
     except Exception as exc:  # noqa: BLE001
@@ -627,32 +703,34 @@ def preserve_recording(cfg: dict, wav_path: Path, reason: str) -> tuple[float, b
         return 0.0, False
 
 
-def rescue_orphaned_recording(cfg: dict) -> None:
-    """Clear the working WAV — but never discard what a dead recorder left there.
+def sweep_orphaned_recordings(cfg: dict) -> None:
+    """Deal with recordings left behind by recorders that are no longer running.
 
-    A recorder killed outright never ran its own cleanup, so its capture sits in
-    the runtime dir with nobody to transcribe it. The next press of the key used
-    to delete it unseen, which is how a crash three minutes in became silence.
+    A recorder killed outright (OOM, SIGKILL, a session that ended under it)
+    never ran its own cleanup, so its capture sits in the runtime dir with
+    nobody to transcribe it. Files belonging to a live recorder are left strictly
+    alone — that is someone else's session in progress.
     """
-    seconds, in_slot = preserve_recording(cfg, AUDIO_PATH, "orphaned recording")
-    if not seconds:
-        AUDIO_PATH.unlink(missing_ok=True)
-        return
-    if in_slot:
-        AUDIO_PATH.unlink(missing_ok=True)
-        body = f"Recovered {seconds:.0f}s from an interrupted recording. {RESEND_HINT}"
-    else:
-        # The recovery slot is off, so this file is the only copy — and the
-        # recorder is about to need the name. Move it aside rather than delete
-        # it: same volatile runtime dir, so nothing is persisted that was not
-        # already there, and doctor reports it until it is dealt with.
-        try:
-            AUDIO_PATH.replace(ORPHAN_PATH)
-            body = f"Recovered {seconds:.0f}s from an interrupted recording, at {ORPHAN_PATH}"
-        except OSError as exc:
-            log(f"could not set aside the interrupted recording: {exc}")
-            return
-    notify("⚠️ Dictation", body, "dialog-warning", "problem")
+    # Oldest first, so when several are waiting the newest one ends up in the
+    # slot. "recording.wav" has no owner in its name — it predates this scheme.
+    for wav in sorted(runtime_dir().glob("recording*.wav"), key=lambda f: f.stat().st_mtime):
+        pid = session_pid_of(wav)
+        if pid is not None and pid != os.getpid() and _process_alive(pid):
+            continue  # a recorder is filling it right now
+        mode = current_mode(pid) if pid is not None else "full"
+        seconds, in_slot = preserve_recording(cfg, wav, mode, "orphaned recording")
+        if in_slot or not seconds:
+            wav.unlink(missing_ok=True)
+        if seconds and in_slot:
+            notify(
+                "⚠️ Dictation",
+                f"Recovered {seconds:.0f}s from an interrupted recording. {RESEND_HINT}",
+                "dialog-warning",
+                "problem",
+            )
+        if pid is not None:
+            session_mode_path(pid).unlink(missing_ok=True)
+            session_transcript_path(pid).unlink(missing_ok=True)
 
 
 def report_recorder_failure(cfg: dict, exc: Exception) -> None:
@@ -660,14 +738,15 @@ def report_recorder_failure(cfg: dict, exc: Exception) -> None:
     import traceback
 
     log("recorder failed:\n" + traceback.format_exc())
-    seconds, in_slot = preserve_recording(cfg, AUDIO_PATH, "recorder failed")
+    audio_path = session_audio_path(os.getpid())
+    seconds, in_slot = preserve_recording(cfg, audio_path, current_mode(os.getpid()), "recorder failed")
     if seconds and in_slot:
-        AUDIO_PATH.unlink(missing_ok=True)
+        audio_path.unlink(missing_ok=True)
         body = f"Recording failed after {seconds:.0f}s — the audio is saved. {RESEND_HINT}"
     elif seconds:
-        body = f"Recording failed after {seconds:.0f}s — audio kept at {AUDIO_PATH}"
+        body = f"Recording failed after {seconds:.0f}s — audio kept at {audio_path}"
     else:
-        AUDIO_PATH.unlink(missing_ok=True)
+        audio_path.unlink(missing_ok=True)
         body = f"Recording failed: {exc}"
     notify("❌ Dictation", body, "dialog-error", "problem")
 
@@ -716,8 +795,8 @@ def record(cfg: dict, simple: bool = False) -> None:
     """Record the microphone until we receive SIGTERM/SIGINT, then exit cleanly.
 
     `simple` records the plain old way: no overlay, and stop() will run a
-    single-pass transcription. The mode is remembered in MODE_PATH so the
-    session finishes the way it started, whichever shortcut stops it.
+    single-pass transcription. The mode is remembered in the session's own mode
+    file so it finishes the way it started, whichever shortcut stops it.
     """
     if not claim_recorder_slot():
         # Only say "already recording" when something actually is: a claim that
@@ -731,13 +810,12 @@ def record(cfg: dict, simple: bool = False) -> None:
                    "dialog-warning", "problem")
         return
 
-    # Before this session overwrites the working file, keep anything a recorder
-    # that died without cleaning up left behind. MODE_PATH still names the mode
-    # that leftover was recorded in, so this has to happen before the write.
-    rescue_orphaned_recording(cfg)
+    # Anything a dead recorder left behind is kept before this session adds its
+    # own files; a live recorder's are untouched.
+    sweep_orphaned_recordings(cfg)
 
     try:
-        MODE_PATH.write_text("simple" if simple else "full")
+        session_mode_path(os.getpid()).write_text("simple" if simple else "full")
     except OSError:
         pass
 
@@ -753,6 +831,8 @@ def record(cfg: dict, simple: bool = False) -> None:
         else:
             record_groq(cfg)
     finally:
+        # The mode file outlives the recorder only until its stopper has read it,
+        # and the stopper removes it then; nothing else may.
         release_recorder_slot()
 
 
@@ -761,6 +841,7 @@ def record_groq(cfg: dict) -> None:
     import sounddevice as sd
     import soundfile as sf
 
+    audio_path = session_audio_path(os.getpid())
     log(f"recorder starting; input device: {sd.query_devices(kind='input')['name']}")
 
     stop_event = threading.Event()
@@ -778,12 +859,12 @@ def record_groq(cfg: dict) -> None:
             log_debug(f"audio status: {status}")
         audio_q.put(indata.copy())
 
-    AUDIO_PATH.unlink(missing_ok=True)  # the slot is already claimed by record()
+    audio_path.unlink(missing_ok=True)  # only a stale file under our own pid
     frames_written = 0
 
     try:
         with sf.SoundFile(
-            AUDIO_PATH, mode="x", samplerate=SAMPLE_RATE, channels=1, subtype="PCM_16"
+            audio_path, mode="x", samplerate=SAMPLE_RATE, channels=1, subtype="PCM_16"
         ) as audio_file:
             with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, callback=callback):
                 # Only announce once capture is truly live — this is the user's "go" cue.
@@ -853,7 +934,8 @@ def record_overlay(cfg: dict) -> None:
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
 
-    AUDIO_PATH.unlink(missing_ok=True)
+    audio_path = session_audio_path(os.getpid())
+    audio_path.unlink(missing_ok=True)  # only a stale file under our own pid
 
     events: queue.Queue[tuple] = queue.Queue()  # ("partial"|"final"|"quit", text)
     audio_q: queue.Queue = queue.Queue()
@@ -943,7 +1025,7 @@ def record_overlay(cfg: dict) -> None:
         frames_written = 0
         try:
             with sf.SoundFile(
-                AUDIO_PATH, mode="x", samplerate=SAMPLE_RATE, channels=1, subtype="PCM_16"
+                audio_path, mode="x", samplerate=SAMPLE_RATE, channels=1, subtype="PCM_16"
             ) as audio_file:
                 threading.Thread(target=connect_live, name="dictation-overlay-conn", daemon=True).start()
                 with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, callback=callback):
@@ -1213,7 +1295,8 @@ def record_deepgram(cfg: dict) -> None:
         preview = text if len(text) <= 80 else text[:77] + "…"
         notify("🎙️ Live dictation", preview, "audio-input-microphone", "chatter")
 
-    TRANSCRIPT_PATH.unlink(missing_ok=True)
+    transcript_path = session_transcript_path(os.getpid())
+    transcript_path.unlink(missing_ok=True)
 
     connect_kwargs: dict = {
         "model": cfg["model"] or "nova-3",
@@ -1327,7 +1410,7 @@ def record_deepgram(cfg: dict) -> None:
                 listen_thread.join(timeout=2.0)
 
         text = settled_text(finals, last_partial[0])
-        TRANSCRIPT_PATH.write_text(text, encoding="utf-8")
+        transcript_path.write_text(text, encoding="utf-8")
         log(f"deepgram transcript: {len(text)} chars")
     except Exception as exc:  # noqa: BLE001
         import traceback
@@ -1338,7 +1421,7 @@ def record_deepgram(cfg: dict) -> None:
         text = settled_text(finals, last_partial[0])
         if text:
             try:
-                TRANSCRIPT_PATH.write_text(text, encoding="utf-8")
+                transcript_path.write_text(text, encoding="utf-8")
                 log(f"deepgram recorder kept {len(text)} chars transcribed before the failure")
             except OSError as write_exc:
                 log(f"could not keep the partial transcript: {write_exc}")
@@ -1350,7 +1433,7 @@ def record_deepgram(cfg: dict) -> None:
                 "problem",
             )
         else:
-            TRANSCRIPT_PATH.unlink(missing_ok=True)
+            transcript_path.unlink(missing_ok=True)
             notify("❌ Dictation", f"Deepgram recording failed: {exc}", "dialog-error", "problem")
     finally:
         _release_audio()
@@ -1940,8 +2023,9 @@ def stop(cfg: dict) -> None:
         PID_PATH.unlink(missing_ok=True)
 
     if cfg["stt_backend"] == "deepgram":
-        text = TRANSCRIPT_PATH.read_text(encoding="utf-8").strip() if TRANSCRIPT_PATH.exists() else ""
-        TRANSCRIPT_PATH.unlink(missing_ok=True)
+        transcript_path = session_transcript_path(pid)
+        text = transcript_path.read_text(encoding="utf-8").strip() if transcript_path.exists() else ""
+        transcript_path.unlink(missing_ok=True)
         log(f"deepgram captured transcript: {len(text)} chars")
         if not text:
             notify("⚠️ Dictation", "No speech detected.", "dialog-warning", "problem")
@@ -1952,11 +2036,12 @@ def stop(cfg: dict) -> None:
         deliver_text(cfg, text)
         return
 
-    existed = AUDIO_PATH.exists()
-    size = AUDIO_PATH.stat().st_size if existed else 0
-    log(f"captured audio: {size} bytes")
+    audio_path = session_audio_path(pid)
+    existed = audio_path.exists()
+    size = audio_path.stat().st_size if existed else 0
+    log(f"captured audio: {size} bytes from {audio_path.name}")
     if size < MIN_AUDIO_BYTES:
-        AUDIO_PATH.unlink(missing_ok=True)
+        audio_path.unlink(missing_ok=True)
         if not existed:
             # No file at all is not a short recording: the recorder crashed, or
             # never got a block from the device. Blaming the user for speaking
@@ -1978,16 +2063,15 @@ def stop(cfg: dict) -> None:
             )
         return
 
-    try:
-        mode = MODE_PATH.read_text().strip()
-    except OSError:
-        mode = "full"
-    MODE_PATH.unlink(missing_ok=True)
+    mode = current_mode(pid)
+    session_mode_path(pid).unlink(missing_ok=True)
 
     try:
-        finish_wav_session(cfg, AUDIO_PATH, mode, save_recording=True)
+        finish_wav_session(cfg, audio_path, mode, save_recording=True)
     finally:
-        AUDIO_PATH.unlink(missing_ok=True)
+        # Ours to delete, and only ours: whatever the next dictation is doing by
+        # the time transcription finishes, it is writing under its own name.
+        audio_path.unlink(missing_ok=True)
 
 
 def resend(cfg: dict) -> None:
@@ -2159,13 +2243,15 @@ def doctor(cfg: dict) -> bool:
     if rec_pid:
         print(f"[..] recording right now (pid {rec_pid}) — stop it with: dictation.py stop")
     else:
-        for path, note in (
-            (AUDIO_PATH, "the next start saves it to the recovery slot; resend then transcribes it"),
-            (ORPHAN_PATH, "kept because save_last_recording is off — transcribe or delete it yourself"),
-        ):
-            if path.is_file():
-                secs = path.stat().st_size / (SAMPLE_RATE * 2)
-                print(f"[--] an interrupted recording is waiting ({secs:.0f}s at {path}) — {note}")
+        for wav in sorted(runtime_dir().glob("recording*.wav")):
+            owner = session_pid_of(wav)
+            if owner is not None and _process_alive(owner):
+                continue
+            secs = wav.stat().st_size / (SAMPLE_RATE * 2)
+            note = ("the next start saves it to the recovery slot; resend then transcribes it"
+                    if secs <= MAX_RESCUE_SEC and cfg["save_last_recording"]
+                    else "transcribe or delete it yourself — it is too long, or the slot is off")
+            print(f"[--] an interrupted recording is waiting ({secs:.0f}s at {wav}) — {note}")
     if cfg["save_last_recording"] and LAST_WAV_PATH.is_file():
         meta = load_last_meta()
         size = LAST_WAV_PATH.stat().st_size

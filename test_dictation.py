@@ -146,22 +146,23 @@ class RecorderSlot(unittest.TestCase):
 
 
 class RescuingAudio(unittest.TestCase):
-    """The recording is the one thing a session cannot reconstruct, so no
-    failure path may delete it. A crash three minutes in used to do exactly
-    that, and stop() then reported it as a recording that was too short."""
+    """The recording is the one thing a session cannot reconstruct, so nothing
+    may delete it: not a failure handler, and not another session's cleanup."""
 
     SECONDS = 120
 
     def setUp(self):
         self.cfg = {"save_last_recording": True}
-        for path in (d.AUDIO_PATH, d.LAST_WAV_PATH, d.LAST_TXT_PATH, d.LAST_META_PATH):
+        self.audio = d.session_audio_path(os.getpid())
+        for path in (self.audio, d.LAST_WAV_PATH, d.LAST_TXT_PATH, d.LAST_META_PATH,
+                     d.session_mode_path(os.getpid())):
             path.unlink(missing_ok=True)
             self.addCleanup(path.unlink, True)
 
     def _record(self, path=None, seconds=None):
         import wave
 
-        path = path or d.AUDIO_PATH
+        path = path or self.audio
         with wave.open(str(path), "wb") as w:
             w.setnchannels(1)
             w.setsampwidth(2)
@@ -175,10 +176,30 @@ class RescuingAudio(unittest.TestCase):
         with wave.open(str(path), "rb") as w:
             return w.getnframes() / w.getframerate()
 
+    def _live_process(self):
+        proc = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(lambda: (proc.terminate(), proc.wait()))
+        time.sleep(0.1)
+        return proc
+
+    def test_a_finished_session_cannot_delete_the_next_recording(self):
+        # The failure in the log: stop() deletes the WAV when transcription
+        # finishes, by which time the next dictation is already recording. With
+        # one shared name that cleanup deleted the live recording, which went on
+        # filling an unlinked inode and arrived at its own stop as 0 bytes.
+        finished = self._record(d.session_audio_path(4242), seconds=29)
+        self.addCleanup(finished.unlink, True)
+        live = self._record(seconds=189)
+
+        finished.unlink()  # what stop()'s cleanup does, three minutes later
+
+        self.assertTrue(live.is_file(), "an old stopper deleted the live recording")
+        self.assertEqual(self._readable_seconds(live), 189)
+
     def test_a_crash_keeps_the_audio_it_captured(self):
         self._record()
         d.report_recorder_failure(self.cfg, RuntimeError("PortAudio: device disconnected"))
-        self.assertFalse(d.AUDIO_PATH.exists(), "working file should be cleared once saved")
+        self.assertFalse(self.audio.exists(), "working file should be cleared once saved")
         self.assertEqual(self._readable_seconds(d.LAST_WAV_PATH), self.SECONDS)
         self.assertTrue(d.last_wav_matches_meta(), "resend must be able to pick it up")
 
@@ -186,40 +207,142 @@ class RescuingAudio(unittest.TestCase):
         # libsndfile writes the lengths on close, so a SIGKILL leaves every
         # sample on disk behind a header claiming none of them.
         self._record()
-        with open(d.AUDIO_PATH, "r+b") as fh:
+        with open(self.audio, "r+b") as fh:
             fh.seek(4)
             fh.write((36).to_bytes(4, "little"))
             fh.seek(40)
             fh.write((0).to_bytes(4, "little"))
-        self.assertEqual(self._readable_seconds(d.AUDIO_PATH), 0.0)
-        self.assertTrue(d.repair_wav_header(d.AUDIO_PATH))
-        self.assertEqual(self._readable_seconds(d.AUDIO_PATH), self.SECONDS)
+        self.assertEqual(self._readable_seconds(self.audio), 0.0)
+        self.assertTrue(d.repair_wav_header(self.audio))
+        self.assertEqual(self._readable_seconds(self.audio), self.SECONDS)
 
     def test_repair_leaves_a_healthy_file_untouched(self):
         self._record(seconds=1)
-        before = d.AUDIO_PATH.read_bytes()
-        self.assertFalse(d.repair_wav_header(d.AUDIO_PATH))
-        self.assertEqual(d.AUDIO_PATH.read_bytes(), before)
+        before = self.audio.read_bytes()
+        self.assertFalse(d.repair_wav_header(self.audio))
+        self.assertEqual(self.audio.read_bytes(), before)
 
-    def test_the_next_press_rescues_what_a_dead_recorder_left(self):
+    def test_the_sweep_rescues_what_a_dead_recorder_left(self):
         self._record()
-        d.rescue_orphaned_recording(self.cfg)
-        self.assertFalse(d.AUDIO_PATH.exists())
+        d.sweep_orphaned_recordings(self.cfg)
+        self.assertFalse(self.audio.exists())
         self.assertEqual(self._readable_seconds(d.LAST_WAV_PATH), self.SECONDS)
 
-    def test_with_the_slot_off_the_only_copy_is_set_aside_not_deleted(self):
-        self.addCleanup(d.ORPHAN_PATH.unlink, True)
+    def test_the_sweep_never_touches_a_live_recorders_file(self):
+        proc = self._live_process()
+        live = self._record(d.session_audio_path(proc.pid))
+        self.addCleanup(live.unlink, True)
+        d.sweep_orphaned_recordings(self.cfg)
+        self.assertTrue(live.is_file(), "swept away a recording still being written")
+        self.assertFalse(d.LAST_WAV_PATH.exists())
+
+    def test_an_abandoned_hours_long_capture_does_not_take_the_slot(self):
+        # A recorder nobody stopped is not a lost dictation; overwriting the slot
+        # with it would discard the real one and hand resend an unusable upload.
+        self.addCleanup(setattr, d, "MAX_RESCUE_SEC", d.MAX_RESCUE_SEC)
+        d.MAX_RESCUE_SEC = 10.0
+        self._record(seconds=60)
+        d.sweep_orphaned_recordings(self.cfg)
+        self.assertFalse(d.LAST_WAV_PATH.exists(), "clobbered the recovery slot")
+        self.assertTrue(self.audio.is_file(), "deleted it instead of leaving it for the user")
+
+    def test_with_the_slot_off_the_only_copy_is_left_alone(self):
         self._record()
-        d.rescue_orphaned_recording({"save_last_recording": False})
-        self.assertFalse(d.AUDIO_PATH.exists(), "the recorder needs the name free")
-        self.assertEqual(self._readable_seconds(d.ORPHAN_PATH), self.SECONDS)
+        d.sweep_orphaned_recordings({"save_last_recording": False})
+        self.assertTrue(self.audio.is_file(), "deleted the only copy of the audio")
         self.assertFalse(d.LAST_WAV_PATH.exists(), "wrote audio the user asked not to keep")
 
     def test_a_genuinely_tiny_take_is_not_hoarded(self):
-        d.AUDIO_PATH.write_bytes(b"\0" * 100)
-        self.assertEqual(d.preserve_recording(self.cfg, d.AUDIO_PATH, "tiny"), (0.0, False))
-        d.rescue_orphaned_recording(self.cfg)
-        self.assertFalse(d.AUDIO_PATH.exists())
+        self.audio.write_bytes(b"\0" * 100)
+        self.assertEqual(d.preserve_recording(self.cfg, self.audio, "full", "tiny"), (0.0, False))
+        d.sweep_orphaned_recordings(self.cfg)
+        self.assertFalse(self.audio.exists())
+
+
+class StopIsolation(unittest.TestCase):
+    """stop() end to end, with a second session recording alongside it — the
+    shape of the failure in the log: 189.30s captured, 0 bytes at the stop."""
+
+    def setUp(self):
+        self.cfg = {
+            "stt_backend": "groq", "save_last_recording": True, "api_key": "k",
+            "ensemble": False, "deepgram_api_key": "", "gemini_api_key": "",
+            "lab": False, "save_history": False,
+        }
+        self.notes = []
+        for name, stub in (
+            ("transcribe_with_retry", lambda cfg, path, mode: (f"text from {path.name}", None)),
+            ("deliver_text", lambda cfg, text, **kw: self.delivered.append(text)),
+            ("notify", lambda title, body="", *a, **k: self.notes.append(f"{title} {body}")),
+        ):
+            self.addCleanup(setattr, d, name, getattr(d, name))
+            setattr(d, name, stub)
+        self.delivered = []
+        d.PID_PATH.unlink(missing_ok=True)
+        self.addCleanup(d.PID_PATH.unlink, True)
+        for path in (d.LAST_WAV_PATH, d.LAST_TXT_PATH, d.LAST_META_PATH):
+            path.unlink(missing_ok=True)
+            self.addCleanup(path.unlink, True)
+
+    def _session(self, seconds, mode="simple"):
+        """A live 'recorder' process with its own WAV and mode file."""
+        import wave
+
+        proc = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(lambda: (proc.poll() is None and (proc.terminate(), proc.wait())))
+        wav = d.session_audio_path(proc.pid)
+        with wave.open(str(wav), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(d.SAMPLE_RATE)
+            w.writeframes(b"\x01\x02" * (d.SAMPLE_RATE * seconds))
+        d.session_mode_path(proc.pid).write_text(mode)
+        self.addCleanup(wav.unlink, True)
+        self.addCleanup(d.session_mode_path(proc.pid).unlink, True)
+        return proc, wav
+
+    def test_stop_transcribes_its_own_session_and_leaves_the_other_alone(self):
+        stopping, stopping_wav = self._session(30)
+        recording, recording_wav = self._session(189)
+        d.PID_PATH.write_text(d._slot_record(stopping.pid))
+
+        d.stop(self.cfg)
+
+        self.assertEqual(self.delivered, [f"text from {stopping_wav.name}"])
+        self.assertFalse(stopping_wav.exists(), "its own file should be cleaned up")
+        self.assertTrue(recording_wav.is_file(), "deleted a recording still in progress")
+        self.assertEqual(recording_wav.stat().st_size, d.SAMPLE_RATE * 2 * 189 + 44)
+        self.assertNotIn("too short", " ".join(self.notes).lower())
+
+    def test_a_recorder_that_wrote_nothing_is_not_blamed_on_the_speaker(self):
+        stopping, stopping_wav = self._session(30)
+        stopping_wav.unlink()  # a crash deleted it, the old way
+        d.PID_PATH.write_text(d._slot_record(stopping.pid))
+
+        d.stop(self.cfg)
+
+        joined = " ".join(self.notes).lower()
+        self.assertIn("captured nothing", joined)
+        self.assertNotIn("too short", joined)
+        self.assertEqual(self.delivered, [])
+
+
+class ClipboardHandoff(unittest.TestCase):
+    """A clipboard tool is the clipboard: it keeps running to serve the
+    selection. Waiting for it to exit once cost 31 minutes."""
+
+    def test_a_tool_that_keeps_running_is_treated_as_serving(self):
+        started = time.monotonic()
+        ok = d._hand_to_clipboard_tool("fake", ["sh", "-c", "cat >/dev/null; sleep 60"], b"hi")
+        waited = time.monotonic() - started
+        self.assertTrue(ok)
+        self.assertLess(waited, d.CLIPBOARD_HANDOFF_SEC * 2 + 1, "waited on the serving daemon")
+
+    def test_a_tool_that_fails_is_still_reported(self):
+        self.assertFalse(d._hand_to_clipboard_tool("fake", ["sh", "-c", "cat >/dev/null; exit 3"], b"hi"))
+
+    def test_a_missing_tool_is_reported(self):
+        self.assertFalse(d._hand_to_clipboard_tool("nope", ["/nonexistent/clipboard-tool"], b"hi"))
 
 
 class SettledText(unittest.TestCase):
