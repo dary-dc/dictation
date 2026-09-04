@@ -314,20 +314,24 @@ def notify(title: str, body: str = "", icon: str = "audio-input-microphone",
            category: str = "chatter", *, force: bool = False) -> None:
     """Send a desktop notification if the current level permits the category.
 
-    Safe with arbitrary text (no shell). Every notification is logged in debug
-    mode, even when the level suppresses it. ``force=True`` always shows — for
-    explicit user actions like resend where silence reads as "broken".
+    Safe with arbitrary text (no shell). Every notification is logged, even when
+    the level suppresses it. ``force=True`` always shows — for explicit user
+    actions like resend where silence reads as "broken". Problems stay on
+    screen; only routine notifications replace one another.
     """
     allowed = force or category in NOTIFY_LEVELS.get(_notify_level, set())
     log(f"notify[{category}] {'show' if allowed else 'suppressed'}: {title} — {body}")
     if not allowed or not shutil.which("notify-send"):
         return
-    cmd = [
-        "notify-send",
-        "--app-name", "Dictation",
-        # Make successive dictation notifications replace each other instead of stacking.
-        "-h", "string:x-canonical-private-synchronous:dictation",
-    ]
+    cmd = ["notify-send", "--app-name", "Dictation"]
+    if category != "problem":
+        # Successive routine notifications replace each other rather than
+        # stacking: recording → transcribing → done is one card, not three.
+        # Problems are left out of that on purpose. Sharing the tag meant the
+        # next press's "Recording…" could wipe a "Recording failed" off the
+        # screen a second after it appeared, and the failure a user never sees
+        # is the failure they cannot act on.
+        cmd += ["-h", "string:x-canonical-private-synchronous:dictation"]
     if icon:
         cmd += ["-i", icon]
     cmd += [title, body]
@@ -732,6 +736,13 @@ def sweep_orphaned_recordings(cfg: dict) -> None:
             session_mode_path(pid).unlink(missing_ok=True)
             session_transcript_path(pid).unlink(missing_ok=True)
 
+    # A recorder stopped before it opened the microphone leaves a mode file and
+    # no WAV, so the loop above never sees it.
+    for leftover in (*runtime_dir().glob("recorder-*.mode"), *runtime_dir().glob("transcript-*.txt")):
+        pid = session_pid_of(leftover)
+        if pid is None or pid == os.getpid() or not _process_alive(pid):
+            leftover.unlink(missing_ok=True)
+
 
 def report_recorder_failure(cfg: dict, exc: Exception) -> None:
     """A crashed recorder announces what it saved, not just that it broke."""
@@ -791,6 +802,41 @@ class StallWatch:
 # --------------------------------------------------------------------------- #
 # Recorder
 # --------------------------------------------------------------------------- #
+# Set the moment a stop is asked for, whether or not the recorder is live yet.
+_stop_requested = threading.Event()
+
+
+def arm_stop_signals() -> None:
+    """Be ready to be stopped from the instant the slot is claimed.
+
+    record() claims the recorder slot and then spends ~0.3 s importing
+    sounddevice (~0.5 s more for Qt in the overlay). A stop arriving in that
+    window used to find no handler installed, so it took the default
+    disposition: the process died where it stood, without releasing its claim
+    and without the recorders ever learning that anyone had asked. Arming here
+    costs nothing and closes the window — a stop that lands before the
+    microphone is live is simply obeyed before it opens.
+    """
+    def request_stop(signum, frame):  # noqa: ARG001
+        _stop_requested.set()
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+
+
+def stopped_before_going_live(what: str) -> bool:
+    """True if the stop landed while we were still loading — so don't open the mic.
+
+    Opening the device only to close it again would leave an empty WAV behind
+    and take the microphone for a moment on the way out. The honest outcome is
+    that this press recorded nothing, and the log says exactly why.
+    """
+    if not _stop_requested.is_set():
+        return False
+    log(f"{what}: stop arrived before the microphone was live — nothing recorded")
+    return True
+
+
 def record(cfg: dict, simple: bool = False) -> None:
     """Record the microphone until we receive SIGTERM/SIGINT, then exit cleanly.
 
@@ -809,6 +855,8 @@ def record(cfg: dict, simple: bool = False) -> None:
             notify("⚠️ Dictation", f"Could not start — see {state_dir() / 'debug.log'}",
                    "dialog-warning", "problem")
         return
+
+    arm_stop_signals()
 
     # Anything a dead recorder left behind is kept before this session adds its
     # own files; a live recorder's are untouched.
@@ -844,13 +892,9 @@ def record_groq(cfg: dict) -> None:
     audio_path = session_audio_path(os.getpid())
     log(f"recorder starting; input device: {sd.query_devices(kind='input')['name']}")
 
-    stop_event = threading.Event()
-
-    def request_stop(signum, frame):  # noqa: ARG001
-        stop_event.set()
-
-    signal.signal(signal.SIGTERM, request_stop)
-    signal.signal(signal.SIGINT, request_stop)
+    stop_event = _stop_requested  # armed by record() before the imports above
+    if stopped_before_going_live("recorder"):
+        return
 
     audio_q: queue.Queue = queue.Queue()
 
@@ -926,13 +970,9 @@ def record_overlay(cfg: dict) -> None:
     import sounddevice as sd
     import soundfile as sf
 
-    stop_event = threading.Event()
-
-    def request_stop(signum, frame):  # noqa: ARG001
-        stop_event.set()
-
-    signal.signal(signal.SIGTERM, request_stop)
-    signal.signal(signal.SIGINT, request_stop)
+    stop_event = _stop_requested  # armed by record() before the imports above
+    if stopped_before_going_live("overlay recorder"):
+        return
 
     audio_path = session_audio_path(os.getpid())
     audio_path.unlink(missing_ok=True)  # only a stale file under our own pid
@@ -1266,13 +1306,9 @@ def record_deepgram(cfg: dict) -> None:
 
     log(f"deepgram recorder starting; input: {sd.query_devices(kind='input')['name']}")
 
-    stop_event = threading.Event()
-
-    def request_stop(signum, frame):  # noqa: ARG001
-        stop_event.set()
-
-    signal.signal(signal.SIGTERM, request_stop)
-    signal.signal(signal.SIGINT, request_stop)
+    stop_event = _stop_requested  # armed by record() before the imports above
+    if stopped_before_going_live("deepgram recorder"):
+        return
 
     audio_q: queue.Queue = queue.Queue()
     finals: list[str] = []
@@ -2042,6 +2078,7 @@ def stop(cfg: dict) -> None:
     log(f"captured audio: {size} bytes from {audio_path.name}")
     if size < MIN_AUDIO_BYTES:
         audio_path.unlink(missing_ok=True)
+        session_mode_path(pid).unlink(missing_ok=True)
         if not existed:
             # No file at all is not a short recording: the recorder crashed, or
             # never got a block from the device. Blaming the user for speaking

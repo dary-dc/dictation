@@ -10,7 +10,7 @@ whether a second recorder starts, the vote that picks the text, and the tail
 stripper that can eat the end of it.
 """
 import os
-import multiprocessing as mp
+import signal
 import subprocess
 import sys
 import tempfile
@@ -96,25 +96,41 @@ class RecorderSlot(unittest.TestCase):
         self.assertFalse(d.claim_recorder_slot())
         self.assertEqual(d._slot_owner(), os.getpid())
 
+    # Real recorders are separate processes started by a keyboard shortcut, so
+    # the presses here are too: subprocesses agree on a wall-clock instant and
+    # all claim at it. (multiprocessing would be shorter, but its default start
+    # method is per-version — 3.14 switched Linux to forkserver, which pickles
+    # the target and cannot take a local function.)
+    PRESS = """
+import os, sys, time
+sys.path.insert(0, os.environ["DICTATION_DIR"])
+import dictation as d
+time.sleep(max(0.0, float(sys.argv[1]) - time.time()))
+ok = d.claim_recorder_slot()
+print(f"{os.getpid()} {int(ok)}", flush=True)
+time.sleep(2)  # a real recorder holds the slot for as long as it records
+"""
+
     def test_simultaneous_starts_produce_exactly_one_recorder(self):
         # The original bug: both presses passed an "is it recording?" check
         # during the ~1 s of imports before either wrote the PID file.
         n = 6
-        barrier, queue, done = mp.Barrier(n), mp.Queue(), mp.Event()
+        press_at = time.time() + 1.0
+        env = dict(os.environ, DICTATION_DIR=os.path.dirname(os.path.abspath(__file__)))
+        procs = [
+            subprocess.Popen(
+                [sys.executable, "-c", self.PRESS, str(press_at)],
+                stdout=subprocess.PIPE, text=True, env=env,
+            )
+            for _ in range(n)
+        ]
+        for proc in procs:
+            self.addCleanup(lambda p=proc: (p.poll() is None and (p.kill(), p.wait())))
 
-        def press(barrier, queue, done):
-            barrier.wait()
-            queue.put((os.getpid(), d.claim_recorder_slot()))
-            done.wait(10)  # a real recorder holds the slot while it records
+        results = [proc.stdout.readline().split() for proc in procs]
+        owner = d._slot_owner()  # while the winner is still holding it
 
-        procs = [mp.Process(target=press, args=(barrier, queue, done)) for _ in range(n)]
-        for p in procs:
-            p.start()
-        winners = [pid for pid, ok in (queue.get() for _ in range(n)) if ok]
-        owner = d._slot_owner()
-        done.set()
-        for p in procs:
-            p.join()
+        winners = [int(pid) for pid, ok in results if ok == "1"]
         self.assertEqual(len(winners), 1, f"{len(winners)} recorders started at once")
         self.assertEqual(owner, winners[0], "the PID file names a loser, orphaning the winner")
 
@@ -327,13 +343,95 @@ class StopIsolation(unittest.TestCase):
         self.assertEqual(self.delivered, [])
 
 
+class StopBeforeLive(unittest.TestCase):
+    """A stop can arrive in the ~0.3 s (~0.8 s with Qt) a recorder spends
+    loading, after it has claimed the slot. Until it is armed for that, the
+    signal takes the default disposition and kills it where it stands."""
+
+    # A recorder claiming the slot, then "importing" for a second. With the
+    # handlers armed first, the SIGTERM in between is recorded and obeyed;
+    # without, the default disposition kills the process outright.
+    RECORDER = """
+import os, sys, time
+sys.path.insert(0, os.environ["DICTATION_DIR"])
+import dictation as d
+d.claim_recorder_slot()
+if os.environ.get("ARMED") == "1":
+    d.arm_stop_signals()
+print("claimed", flush=True)
+time.sleep(1.0)                                   # the sounddevice / Qt imports
+print("stopped" if d.stopped_before_going_live("recorder") else "live", flush=True)
+d.release_recorder_slot()
+"""
+
+    def setUp(self):
+        d.PID_PATH.unlink(missing_ok=True)
+        self.addCleanup(d.PID_PATH.unlink, True)
+
+    def _run_recorder(self, armed):
+        env = dict(os.environ, DICTATION_DIR=os.path.dirname(os.path.abspath(__file__)),
+                   ARMED="1" if armed else "0")
+        proc = subprocess.Popen([sys.executable, "-c", self.RECORDER],
+                                stdout=subprocess.PIPE, text=True, env=env)
+        self.addCleanup(lambda: (proc.poll() is None and (proc.kill(), proc.wait())))
+        self.assertEqual(proc.stdout.readline().strip(), "claimed")
+        proc.terminate()  # the stop press, while it is still loading
+        return proc
+
+    def test_a_stop_during_startup_is_obeyed_not_fatal(self):
+        proc = self._run_recorder(armed=True)
+        self.assertEqual(proc.stdout.readline().strip(), "stopped")
+        self.assertEqual(proc.wait(timeout=5), 0, "should exit cleanly, not on a signal")
+        self.assertFalse(d.PID_PATH.exists(), "a clean exit releases the recorder slot")
+
+    def test_without_arming_the_same_stop_kills_the_recorder(self):
+        # Guards the ordering in record(): arm, then import. If someone moves
+        # the arming back after the imports, this is what the user gets.
+        proc = self._run_recorder(armed=False)
+        self.assertEqual(proc.wait(timeout=5), -signal.SIGTERM, "expected a hard kill")
+        self.assertEqual(proc.stdout.read().strip(), "", "it never reached its own cleanup")
+        self.assertTrue(d.PID_PATH.exists(), "and the claim is left behind")
+
+
+class ProblemNotificationsStay(unittest.TestCase):
+    """A failure the user never sees is a failure they cannot act on."""
+
+    def setUp(self):
+        self.sent = []
+        self.addCleanup(setattr, d, "subprocess", d.subprocess)
+        real_which, real_run = d.shutil.which, d.subprocess.run
+        d.shutil.which = lambda name: f"/usr/bin/{name}"
+        d.subprocess.run = lambda cmd, **kw: self.sent.append(cmd)
+        self.addCleanup(setattr, d.shutil, "which", real_which)
+        self.addCleanup(setattr, d.subprocess, "run", real_run)
+        level = d._notify_level
+        self.addCleanup(d.configure, level, d._debug)
+        d.configure("all", False)
+
+    def _tag_in_last(self):
+        return any("x-canonical-private-synchronous" in str(arg) for arg in self.sent[-1])
+
+    def test_routine_notifications_still_replace_each_other(self):
+        d.notify("🎙️ Recording…", "speak", "icon", "start")
+        self.assertTrue(self._tag_in_last(), "routine cards should collapse into one")
+
+    def test_a_problem_is_not_replaceable(self):
+        d.notify("❌ Dictation", "Recording failed", "icon", "problem")
+        self.assertFalse(self._tag_in_last(), "an error can be wiped by the next press")
+
+
 class ClipboardHandoff(unittest.TestCase):
     """A clipboard tool is the clipboard: it keeps running to serve the
     selection. Waiting for it to exit once cost 31 minutes."""
 
     def test_a_tool_that_keeps_running_is_treated_as_serving(self):
+        import warnings
+
         started = time.monotonic()
-        ok = d._hand_to_clipboard_tool("fake", ["sh", "-c", "cat >/dev/null; sleep 60"], b"hi")
+        with warnings.catch_warnings():
+            # Leaving it running is the point: it is serving the selection.
+            warnings.simplefilter("ignore", ResourceWarning)
+            ok = d._hand_to_clipboard_tool("fake", ["sh", "-c", "cat >/dev/null; sleep 5"], b"hi")
         waited = time.monotonic() - started
         self.assertTrue(ok)
         self.assertLess(waited, d.CLIPBOARD_HANDOFF_SEC * 2 + 1, "waited on the serving daemon")

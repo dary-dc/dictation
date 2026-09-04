@@ -218,6 +218,10 @@ uv run dictation.py toggle --quiet          # = --notify none
 > use keeps the cache warm, recording starts near-instantly, so this is usually fine
 > — but `minimal` is the safer pick if you want that confirmation.
 
+Routine toasts replace each other, so a dictation is one card that updates rather
+than three stacked ones. Failures are deliberately left out of that: an error
+stays on screen until you dismiss it, instead of being wiped by the next press.
+
 ## Debugging
 
 The log is **always** written, whether or not you asked for it:
